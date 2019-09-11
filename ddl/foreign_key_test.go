@@ -14,18 +14,17 @@
 package ddl
 
 import (
+	"context"
 	"strings"
 	"sync"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/util/testleak"
-	goctx "golang.org/x/net/context"
 )
 
 var _ = Suite(&testForeighKeySuite{})
@@ -34,7 +33,7 @@ type testForeighKeySuite struct {
 	store  kv.Storage
 	dbInfo *model.DBInfo
 	d      *ddl
-	ctx    context.Context
+	ctx    sessionctx.Context
 }
 
 func (s *testForeighKeySuite) SetUpSuite(c *C) {
@@ -76,12 +75,14 @@ func (s *testForeighKeySuite) testCreateForeignKey(c *C, tblInfo *model.TableInf
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{fkInfo},
 	}
-	err := s.d.doDDLJob(s.ctx, job)
+	err := s.ctx.NewTxn(context.Background())
+	c.Assert(err, IsNil)
+	err = s.d.doDDLJob(s.ctx, job)
 	c.Assert(err, IsNil)
 	return job
 }
 
-func testDropForeignKey(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, foreignKeyName string) *model.Job {
+func testDropForeignKey(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, foreignKeyName string) *model.Job {
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		TableID:    tblInfo.ID,
@@ -110,8 +111,11 @@ func getForeignKey(t table.Table, name string) *model.FKInfo {
 }
 
 func (s *testForeighKeySuite) TestForeignKey(c *C) {
-	defer testleak.AfterTest(c)()
-	d := testNewDDL(goctx.Background(), nil, s.store, nil, nil, testLease)
+	d := newDDL(
+		context.Background(),
+		WithStore(s.store),
+		WithLease(testLease),
+	)
 	defer d.Stop()
 	s.d = d
 	s.dbInfo = testSchemaInfo(c, d, "test_foreign")
@@ -120,12 +124,14 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	testCreateSchema(c, ctx, d, s.dbInfo)
 	tblInfo := testTableInfo(c, d, "t", 3)
 
-	err := ctx.NewTxn()
+	err := ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
 
 	testCreateTable(c, ctx, d, s.dbInfo, tblInfo)
 
-	err = ctx.Txn().Commit()
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
 	// fix data race
@@ -134,7 +140,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	var hookErr error
 	tc := &TestDDLCallback{}
 	tc.onJobUpdated = func(job *model.Job) {
-		if job.State != model.JobDone {
+		if job.State != model.JobStateDone {
 			return
 		}
 		mu.Lock()
@@ -152,14 +158,17 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 		}
 		checkOK = true
 	}
+	originalHook := d.GetHook()
+	defer d.SetHook(originalHook)
 	d.SetHook(tc)
-
 	d.Stop()
-	d.start(goctx.Background())
+	d.start(context.Background(), nil)
 
 	job := s.testCreateForeignKey(c, tblInfo, "c1_fk", []string{"c1"}, "t2", []string{"c1"}, ast.ReferOptionCascade, ast.ReferOptionSetNull)
 	testCheckJobDone(c, d, job, true)
-	err = ctx.Txn().Commit()
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 	mu.Lock()
 	hErr := hookErr
@@ -173,8 +182,10 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	mu.Lock()
 	checkOK = false
 	mu.Unlock()
-	tc.onJobUpdated = func(job *model.Job) {
-		if job.State != model.JobDone {
+	// fix data race pr/#9491
+	tc2 := &TestDDLCallback{}
+	tc2.onJobUpdated = func(job *model.Job) {
+		if job.State != model.JobStateDone {
 			return
 		}
 		mu.Lock()
@@ -192,9 +203,9 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 		}
 		checkOK = true
 	}
-
+	d.SetHook(tc2)
 	d.Stop()
-	d.start(goctx.Background())
+	d.start(context.Background(), nil)
 
 	job = testDropForeignKey(c, ctx, d, s.dbInfo, tblInfo, "c1_fk")
 	testCheckJobDone(c, d, job, false)
@@ -205,18 +216,17 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	c.Assert(hErr, IsNil)
 	c.Assert(ok, IsTrue)
 
-	err = ctx.NewTxn()
+	err = ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
 
-	tc.onJobUpdated = func(job *model.Job) {
-	}
-
 	d.Stop()
-	d.start(goctx.Background())
+	d.start(context.Background(), nil)
 
 	job = testDropTable(c, ctx, d, s.dbInfo, tblInfo)
 	testCheckJobDone(c, d, job, false)
 
-	err = ctx.Txn().Commit()
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 }

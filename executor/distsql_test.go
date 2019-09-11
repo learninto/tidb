@@ -15,54 +15,23 @@ package executor_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"runtime/pprof"
 	"strings"
-	"sync/atomic"
-	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/tikv"
+	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testkit"
 )
-
-// TestIndexDoubleReadClose checks that when a index double read returns before reading all the rows, the goroutine doesn't
-// leak. For testing distsql with multiple regions, we need to manually split a mock TiKV.
-func (s *testSuite) TestIndexDoubleReadClose(c *C) {
-	if _, ok := s.store.GetClient().(*tikv.CopClient); !ok {
-		// Make sure the store is tikv store.
-		return
-	}
-	originSize := atomic.LoadInt32(&executor.LookupTableTaskChannelSize)
-	atomic.StoreInt32(&executor.LookupTableTaskChannelSize, 1)
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("set @@tidb_index_lookup_size = '10'")
-	tk.MustExec("use test")
-	tk.MustExec("create table dist (id int primary key, c_idx int, c_col int, index (c_idx))")
-
-	// Insert 100 rows.
-	var values []string
-	for i := 0; i < 100; i++ {
-		values = append(values, fmt.Sprintf("(%d, %d, %d)", i, i, i))
-	}
-	tk.MustExec("insert dist values " + strings.Join(values, ","))
-
-	rss, err := tk.Se.Execute("select * from dist where c_idx between 0 and 100")
-	c.Assert(err, IsNil)
-	rs := rss[0]
-	_, err = rs.Next()
-	c.Assert(err, IsNil)
-	keyword := "pickAndExecTask"
-	c.Check(checkGoroutineExists(keyword), IsTrue)
-	rs.Close()
-	time.Sleep(time.Millisecond * 50)
-	c.Check(checkGoroutineExists(keyword), IsFalse)
-	atomic.StoreInt32(&executor.LookupTableTaskChannelSize, originSize)
-}
 
 func checkGoroutineExists(keyword string) bool {
 	buf := new(bytes.Buffer)
@@ -72,7 +41,7 @@ func checkGoroutineExists(keyword string) bool {
 	return strings.Contains(str, keyword)
 }
 
-func (s *testSuite) TestCopClientSend(c *C) {
+func (s *testSuite3) TestCopClientSend(c *C) {
 	c.Skip("not stable")
 	if _, ok := s.store.GetClient().(*tikv.CopClient); !ok {
 		// Make sure the store is tikv store.
@@ -90,7 +59,7 @@ func (s *testSuite) TestCopClientSend(c *C) {
 	tk.MustExec("insert copclient values " + strings.Join(values, ","))
 
 	// Get table ID for split.
-	dom := sessionctx.GetDomain(tk.Se)
+	dom := domain.GetDomain(tk.Se)
 	is := dom.InfoSchema()
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("copclient"))
 	c.Assert(err, IsNil)
@@ -99,14 +68,15 @@ func (s *testSuite) TestCopClientSend(c *C) {
 	// Split the table.
 	s.cluster.SplitTable(s.mvccStore, tblID, 100)
 
+	ctx := context.Background()
 	// Send coprocessor request when the table split.
-	rss, err := tk.Se.Execute("select sum(id) from copclient")
+	rs, err := tk.Exec("select sum(id) from copclient")
 	c.Assert(err, IsNil)
-	rs := rss[0]
-	defer rs.Close()
-	row, err := rs.Next()
+	req := rs.NewChunk()
+	err = rs.Next(ctx, req)
 	c.Assert(err, IsNil)
-	c.Assert(row.Data[0].GetMysqlDecimal().String(), Equals, "499500")
+	c.Assert(req.GetRow(0).GetMyDecimal(0).String(), Equals, "499500")
+	rs.Close()
 
 	// Split one region.
 	key := tablecodec.EncodeRowKeyWithHandle(tblID, 500)
@@ -115,21 +85,156 @@ func (s *testSuite) TestCopClientSend(c *C) {
 	s.cluster.Split(region.GetId(), s.cluster.AllocID(), key, []uint64{peerID}, peerID)
 
 	// Check again.
-	rss, err = tk.Se.Execute("select sum(id) from copclient")
+	rs, err = tk.Exec("select sum(id) from copclient")
 	c.Assert(err, IsNil)
-	rs = rss[0]
-	row, err = rs.Next()
+	req = rs.NewChunk()
+	err = rs.Next(ctx, req)
 	c.Assert(err, IsNil)
-	c.Assert(row.Data[0].GetMysqlDecimal().String(), Equals, "499500")
+	c.Assert(req.GetRow(0).GetMyDecimal(0).String(), Equals, "499500")
 	rs.Close()
 
 	// Check there is no goroutine leak.
-	rss, err = tk.Se.Execute("select * from copclient order by id")
+	rs, err = tk.Exec("select * from copclient order by id")
 	c.Assert(err, IsNil)
-	rs = rss[0]
-	_, err = rs.Next()
+	req = rs.NewChunk()
+	err = rs.Next(ctx, req)
 	c.Assert(err, IsNil)
 	rs.Close()
 	keyword := "(*copIterator).work"
 	c.Check(checkGoroutineExists(keyword), IsFalse)
+}
+
+func (s *testSuite3) TestGetLackHandles(c *C) {
+	expectedHandles := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	handlesMap := make(map[int64]struct{})
+	for _, h := range expectedHandles {
+		handlesMap[h] = struct{}{}
+	}
+
+	// expected handles 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+	// obtained handles 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+	diffHandles := executor.GetLackHandles(expectedHandles, handlesMap)
+	c.Assert(diffHandles, HasLen, 0)
+	c.Assert(handlesMap, HasLen, 0)
+
+	// expected handles 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+	// obtained handles 2, 3, 4, 6, 7, 8, 9
+	retHandles := []int64{2, 3, 4, 6, 7, 8, 9}
+	handlesMap = make(map[int64]struct{})
+	handlesMap[1] = struct{}{}
+	handlesMap[5] = struct{}{}
+	handlesMap[10] = struct{}{}
+	diffHandles = executor.GetLackHandles(expectedHandles, handlesMap)
+	c.Assert(retHandles, DeepEquals, diffHandles)
+}
+
+func (s *testSuite3) TestBigIntPK(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t(a bigint unsigned primary key, b int, c int, index idx(a, b))")
+	tk.MustExec("insert into t values(1, 1, 1), (9223372036854775807, 2, 2)")
+	tk.MustQuery("select * from t use index(idx) order by a").Check(testkit.Rows("1 1 1", "9223372036854775807 2 2"))
+}
+
+func (s *testSuite3) TestCorColToRanges(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("set sql_mode='STRICT_TRANS_TABLES'") // disable only-full-group-by
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int primary key, b int, c int, index idx(b))")
+	tk.MustExec("insert into t values(1, 1, 1), (2, 2 ,2), (3, 3, 3), (4, 4, 4), (5, 5, 5), (6, 6, 6), (7, 7, 7), (8, 8, 8), (9, 9, 9)")
+	tk.MustExec("analyze table t")
+	// Test single read on table.
+	tk.MustQuery("select t.c in (select count(*) from t s ignore index(idx), t t1 where s.a = t.a and s.a = t1.a) from t").Check(testkit.Rows("1", "0", "0", "0", "0", "0", "0", "0", "0"))
+	// Test single read on index.
+	tk.MustQuery("select t.c in (select count(*) from t s use index(idx), t t1 where s.b = t.a and s.a = t1.a) from t").Check(testkit.Rows("1", "0", "0", "0", "0", "0", "0", "0", "0"))
+	// Test IndexLookUpReader.
+	tk.MustQuery("select t.c in (select count(*) from t s use index(idx), t t1 where s.b = t.a and s.c = t1.a) from t").Check(testkit.Rows("1", "0", "0", "0", "0", "0", "0", "0", "0"))
+}
+
+func (s *testSuite3) TestUniqueKeyNullValueSelect(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	// test null in unique-key
+	tk.MustExec("create table t (id int default null, c varchar(20), unique id (id));")
+	tk.MustExec("insert t (c) values ('a'), ('b'), ('c');")
+	res := tk.MustQuery("select * from t where id is null;")
+	res.Check(testkit.Rows("<nil> a", "<nil> b", "<nil> c"))
+
+	// test null in mul unique-key
+	tk.MustExec("drop table t")
+	tk.MustExec("create table t (id int default null, b int default 1, c varchar(20), unique id_c(id, b));")
+	tk.MustExec("insert t (c) values ('a'), ('b'), ('c');")
+	res = tk.MustQuery("select * from t where id is null and b = 1;")
+	res.Check(testkit.Rows("<nil> 1 a", "<nil> 1 b", "<nil> 1 c"))
+
+	tk.MustExec("drop table t")
+	// test null in non-unique-key
+	tk.MustExec("create table t (id int default null, c varchar(20), key id (id));")
+	tk.MustExec("insert t (c) values ('a'), ('b'), ('c');")
+	res = tk.MustQuery("select * from t where id is null;")
+	res.Check(testkit.Rows("<nil> a", "<nil> b", "<nil> c"))
+}
+
+// TestIssue10178 contains tests for https://github.com/pingcap/tidb/issues/10178 .
+func (s *testSuite3) TestIssue10178(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a bigint unsigned primary key)")
+	tk.MustExec("insert into t values(9223372036854775807), (18446744073709551615)")
+	tk.MustQuery("select max(a) from t").Check(testkit.Rows("18446744073709551615"))
+	tk.MustQuery("select * from t where a > 9223372036854775807").Check(testkit.Rows("18446744073709551615"))
+	tk.MustQuery("select * from t where a < 9223372036854775808").Check(testkit.Rows("9223372036854775807"))
+}
+
+func (s *testSuite3) TestInconsistentIndex(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t")
+	tk.MustExec("create table t(a int, b int, index idx_a(a))")
+	is := s.domain.InfoSchema()
+	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	idx := tbl.Meta().FindIndexByName("idx_a")
+	idxOp := tables.NewIndex(tbl.Meta().ID, tbl.Meta(), idx)
+	ctx := mock.NewContext()
+	ctx.Store = s.store
+
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values (%d, %d)", i+10, i))
+		c.Assert(tk.QueryToErr("select * from t where a>=0"), IsNil)
+	}
+
+	for i := 0; i < 10; i++ {
+		tk.MustExec(fmt.Sprintf("update t set a=%d where a=%d", i, i+10))
+		c.Assert(tk.QueryToErr("select * from t where a>=0"), IsNil)
+	}
+
+	for i := 0; i < 10; i++ {
+		txn, err := s.store.Begin()
+		c.Assert(err, IsNil)
+		_, err = idxOp.Create(ctx, txn, types.MakeDatums(i+10), int64(100+i), table.WithAssertion(txn))
+		c.Assert(err, IsNil)
+		err = txn.Commit(context.Background())
+		c.Assert(err, IsNil)
+
+		err = tk.QueryToErr("select * from t use index(idx_a) where a >= 0")
+		c.Assert(err.Error(), Equals, fmt.Sprintf("inconsistent index idx_a handle count %d isn't equal to value count 10", i+11))
+
+		// if has other conditions, the inconsistent index check doesn't work.
+		err = tk.QueryToErr("select * from t where a>=0 and b<10")
+		c.Assert(err, IsNil)
+	}
+
+	// fix inconsistent problem to pass CI
+	for i := 0; i < 10; i++ {
+		txn, err := s.store.Begin()
+		c.Assert(err, IsNil)
+		err = idxOp.Delete(ctx.GetSessionVars().StmtCtx, txn, types.MakeDatums(i+10), int64(100+i), nil)
+		c.Assert(err, IsNil)
+		err = txn.Commit(context.Background())
+		c.Assert(err, IsNil)
+	}
 }

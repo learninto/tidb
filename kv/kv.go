@@ -14,8 +14,12 @@
 package kv
 
 import (
+	"context"
+
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	goctx "golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/execdetails"
+	"github.com/pingcap/tidb/util/memory"
 )
 
 // Transaction options
@@ -30,19 +34,29 @@ const (
 	PresumeKeyNotExistsError
 	// BinlogInfo contains the binlog data and client.
 	BinlogInfo
-	// Skip existing check when "prewrite".
-	SkipCheckForWrite
-	// SchemaLeaseChecker is used for schema lease check.
-	SchemaLeaseChecker
+	// SchemaChecker is used for checking schema-validity.
+	SchemaChecker
 	// IsolationLevel sets isolation level for current transaction. The default level is SI.
 	IsolationLevel
 	// Priority marks the priority of this transaction.
 	Priority
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog
+	// KeyOnly retrieve only keys, it can be used in scan now.
+	KeyOnly
+	// Pessimistic is defined for pessimistic lock
+	Pessimistic
+	// SnapshotTS is defined to set snapshot ts.
+	SnapshotTS
+	// Set replica read
+	ReplicaRead
 )
 
 // Priority value for transaction priority.
 const (
-	PriorityNormal int = iota
+	PriorityNormal = iota
 	PriorityLow
 	PriorityHigh
 )
@@ -57,30 +71,47 @@ const (
 	RC
 )
 
+// ReplicaReadType is the type of replica to read data from
+type ReplicaReadType byte
+
+const (
+	// ReplicaReadLeader stands for 'read from leader'.
+	ReplicaReadLeader ReplicaReadType = 1 << iota
+	// ReplicaReadFollower stands for 'read from follower'.
+	ReplicaReadFollower
+	// ReplicaReadLearner stands for 'read from learner'.
+	ReplicaReadLearner
+)
+
+// IsFollowerRead checks if leader is going to be used to read data.
+func (r ReplicaReadType) IsFollowerRead() bool {
+	return r == ReplicaReadFollower
+}
+
 // Those limits is enforced to make sure the transaction can be well handled by TiKV.
 var (
 	// TxnEntrySizeLimit is limit of single entry size (len(key) + len(value)).
 	TxnEntrySizeLimit = 6 * 1024 * 1024
-	// TxnEntryCountLimit  is limit of number of entries in the MemBuffer.
-	TxnEntryCountLimit uint64 = 300 * 1000
 	// TxnTotalSizeLimit is limit of the sum of all entry size.
-	TxnTotalSizeLimit = 100 * 1024 * 1024
+	TxnTotalSizeLimit uint64 = config.DefTxnTotalSizeLimit
 )
 
 // Retriever is the interface wraps the basic Get and Seek methods.
 type Retriever interface {
 	// Get gets the value for key k from kv store.
 	// If corresponding kv pair does not exist, it returns nil and ErrNotExist.
-	Get(k Key) ([]byte, error)
-	// Seek creates an Iterator positioned on the first entry that k <= entry's key.
+	Get(ctx context.Context, k Key) ([]byte, error)
+	// Iter creates an Iterator positioned on the first entry that k <= entry's key.
 	// If such entry is not found, it returns an invalid Iterator with no error.
+	// It yields only keys that < upperBound. If upperBound is nil, it means the upperBound is unbounded.
 	// The Iterator must be Closed after use.
-	Seek(k Key) (Iterator, error)
+	Iter(k Key, upperBound Key) (Iterator, error)
 
-	// SeekReverse creates a reversed Iterator positioned on the first entry which key is less than k.
+	// IterReverse creates a reversed Iterator positioned on the first entry which key is less than k.
 	// The returned iterator will iterate from greater key to smaller key.
 	// If k is nil, the returned iterator will be positioned at the last key.
-	SeekReverse(k Key) (Iterator, error)
+	// TODO: Add lower bound limit
+	IterReverse(k Key) (Iterator, error)
 }
 
 // Mutator is the interface wraps the basic Set and Delete methods.
@@ -105,20 +136,26 @@ type MemBuffer interface {
 	Size() int
 	// Len returns the number of entries in the DB.
 	Len() int
+	// Reset cleanup the MemBuffer
+	Reset()
+	// SetCap sets the MemBuffer capability, to reduce memory allocations.
+	// Please call it before you use the MemBuffer, otherwise it will not works.
+	SetCap(cap int)
 }
 
 // Transaction defines the interface for operations inside a Transaction.
 // This is not thread safe.
 type Transaction interface {
 	MemBuffer
+	AssertionProto
 	// Commit commits the transaction operations to KV store.
-	Commit() error
+	Commit(context.Context) error
 	// Rollback undoes the transaction operations to KV store.
 	Rollback() error
 	// String implements fmt.Stringer interface.
 	String() string
 	// LockKeys tries to lock the entries with the keys in KV store.
-	LockKeys(keys ...Key) error
+	LockKeys(ctx context.Context, forUpdateTS uint64, keys ...Key) error
 	// SetOption sets an option with a value, when val is nil, uses the default
 	// value of this option.
 	SetOption(opt Option, val interface{})
@@ -131,12 +168,27 @@ type Transaction interface {
 	// Valid returns if the transaction is valid.
 	// A transaction become invalid after commit or rollback.
 	Valid() bool
+	// GetMemBuffer return the MemBuffer binding to this transaction.
+	GetMemBuffer() MemBuffer
+	// SetVars sets variables to the transaction.
+	SetVars(vars *Variables)
+	// BatchGet gets kv from the memory buffer of statement and transaction, and the kv storage.
+	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
+	IsPessimistic() bool
+}
+
+// AssertionProto is an interface defined for the assertion protocol.
+type AssertionProto interface {
+	// SetAssertion sets an assertion for an operation on the key.
+	SetAssertion(key Key, assertion AssertionType)
+	// Confirm assertions to current position if `succ` is true, reset position otherwise.
+	ConfirmAssertions(succ bool)
 }
 
 // Client is used to send request to KV layer.
 type Client interface {
 	// Send sends request to KV layer, returns a Response.
-	Send(ctx goctx.Context, req *Request) Response
+	Send(ctx context.Context, req *Request, vars *Variables) Response
 
 	// IsRequestTypeSupported checks if reqType and subType is supported.
 	IsRequestTypeSupported(reqType, subType int64) bool
@@ -144,26 +196,29 @@ type Client interface {
 
 // ReqTypes.
 const (
-	ReqTypeSelect = 101
-	ReqTypeIndex  = 102
-	ReqTypeDAG    = 103
+	ReqTypeSelect   = 101
+	ReqTypeIndex    = 102
+	ReqTypeDAG      = 103
+	ReqTypeAnalyze  = 104
+	ReqTypeChecksum = 105
 
-	ReqSubTypeBasic   = 0
-	ReqSubTypeDesc    = 10000
-	ReqSubTypeGroupBy = 10001
-	ReqSubTypeTopN    = 10002
+	ReqSubTypeBasic      = 0
+	ReqSubTypeDesc       = 10000
+	ReqSubTypeGroupBy    = 10001
+	ReqSubTypeTopN       = 10002
+	ReqSubTypeSignature  = 10003
+	ReqSubTypeAnalyzeIdx = 10004
+	ReqSubTypeAnalyzeCol = 10005
 )
 
 // Request represents a kv request.
 type Request struct {
 	// Tp is the request type.
 	Tp        int64
+	StartTs   uint64
 	Data      []byte
 	KeyRanges []KeyRange
-	// KeepOrder is true, if the response should be returned in order.
-	KeepOrder bool
-	// Desc is true, if the request is sent in descending order.
-	Desc bool
+
 	// Concurrency is 1, if it only sends the request to a single storage unit when
 	// ResponseIterator.Next is called. If concurrency is greater than 1, the request will be
 	// sent to multiple storage units concurrently.
@@ -172,14 +227,41 @@ type Request struct {
 	IsolationLevel IsoLevel
 	// Priority is the priority of this KV request, its value may be PriorityNormal/PriorityLow/PriorityHigh.
 	Priority int
+	// MemTracker is used to trace and control memory usage in co-processor layer.
+	MemTracker *memory.Tracker
+	// KeepOrder is true, if the response should be returned in order.
+	KeepOrder bool
+	// Desc is true, if the request is sent in descending order.
+	Desc bool
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache bool
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog bool
+	// Streaming indicates using streaming API for this request, result in that one Next()
+	// call would not corresponds to a whole region result.
+	Streaming bool
+	// ReplicaRead is used for reading data from replicas, only follower is supported at this time.
+	ReplicaRead ReplicaReadType
+}
+
+// ResultSubset represents a result subset from a single storage unit.
+// TODO: Find a better interface for ResultSubset that can reuse bytes.
+type ResultSubset interface {
+	// GetData gets the data.
+	GetData() []byte
+	// GetStartKey gets the start key.
+	GetStartKey() Key
+	// GetExecDetails gets the detail information.
+	GetExecDetails() *execdetails.ExecDetails
+	// MemSize returns how many bytes of memory this result use for tracing memory usage.
+	MemSize() int64
 }
 
 // Response represents the response returned from KV layer.
 type Response interface {
 	// Next returns a resultSubset from a single storage unit.
 	// When full result set is returned, nil is returned.
-	// TODO: Find a better interface for resultSubset that can avoid allocation and reuse bytes.
-	Next() (resultSubset []byte, err error)
+	Next(ctx context.Context) (resultSubset ResultSubset, err error)
 	// Close response.
 	Close() error
 }
@@ -188,7 +270,15 @@ type Response interface {
 type Snapshot interface {
 	Retriever
 	// BatchGet gets a batch of values from snapshot.
-	BatchGet(keys []Key) (map[string][]byte, error)
+	BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error)
+	// SetPriority snapshot set the priority
+	SetPriority(priority int)
+
+	// SetOption sets an option with a value, when val is nil, uses the default
+	// value of this option. Only ReplicaRead is supported for snapshot
+	SetOption(opt Option, val interface{})
+	// DelOption deletes an option.
+	DelOption(opt Option)
 }
 
 // Driver is the interface that must be implemented by a KV storage.
@@ -220,6 +310,12 @@ type Storage interface {
 	GetOracle() oracle.Oracle
 	// SupportDeleteRange gets the storage support delete range or not.
 	SupportDeleteRange() (supported bool)
+	// Name gets the name of the storage engine
+	Name() string
+	// Describe returns of brief introduction of the storage
+	Describe() string
+	// ShowStatus returns the specified status of the storage
+	ShowStatus(ctx context.Context, key string) (interface{}, error)
 }
 
 // FnKeyCmp is the function for iterator the keys
@@ -232,4 +328,11 @@ type Iterator interface {
 	Value() []byte
 	Next() error
 	Close()
+}
+
+// SplitableStore is the kv store which supports split regions.
+type SplitableStore interface {
+	SplitRegions(ctx context.Context, splitKey [][]byte, scatter bool) (regionID []uint64, err error)
+	WaitScatterRegionFinish(regionID uint64, backOff int) error
+	CheckRegionInScattering(regionID uint64) (bool, error)
 }

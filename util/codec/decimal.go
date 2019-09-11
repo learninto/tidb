@@ -14,34 +14,39 @@
 package codec
 
 import (
-	"fmt"
-
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/types"
 )
 
-// EncodeDecimal encodes a decimal d into a byte slice which can be sorted lexicographically later.
-func EncodeDecimal(b []byte, d types.Datum) []byte {
-	dec := d.GetMysqlDecimal()
-	precision := d.Length()
-	frac := d.Frac()
+// EncodeDecimal encodes a decimal into a byte slice which can be sorted lexicographically later.
+func EncodeDecimal(b []byte, dec *types.MyDecimal, precision, frac int) ([]byte, error) {
 	if precision == 0 {
 		precision, frac = dec.PrecisionAndFrac()
 	}
 	b = append(b, byte(precision), byte(frac))
 	bin, err := dec.ToBin(precision, frac)
-	if err != nil {
-		panic(fmt.Sprintf("should not happen, precision %d, frac %d %v", precision, frac, err))
-	}
 	b = append(b, bin...)
-	return b
+	return b, errors.Trace(err)
+}
+
+func valueSizeOfDecimal(dec *types.MyDecimal, precision, frac int) int {
+	if precision == 0 {
+		precision, frac = dec.PrecisionAndFrac()
+	}
+	return types.DecimalBinSize(precision, frac) + 2
 }
 
 // DecodeDecimal decodes bytes to decimal.
-func DecodeDecimal(b []byte) ([]byte, types.Datum, error) {
-	var d types.Datum
+func DecodeDecimal(b []byte) ([]byte, *types.MyDecimal, int, int, error) {
+	failpoint.Inject("errorInDecodeDecimal", func(val failpoint.Value) {
+		if val.(bool) {
+			failpoint.Return(b, nil, 0, 0, errors.New("gofail error"))
+		}
+	})
+
 	if len(b) < 3 {
-		return b, d, errors.New("insufficient bytes to decode value")
+		return b, nil, 0, 0, errors.New("insufficient bytes to decode value")
 	}
 	precision := int(b[0])
 	frac := int(b[1])
@@ -50,10 +55,7 @@ func DecodeDecimal(b []byte) ([]byte, types.Datum, error) {
 	binSize, err := dec.FromBin(b, precision, frac)
 	b = b[binSize:]
 	if err != nil {
-		return b, d, errors.Trace(err)
+		return b, nil, precision, frac, errors.Trace(err)
 	}
-	d.SetLength(precision)
-	d.SetFrac(frac)
-	d.SetMysqlDecimal(dec)
-	return b, d, nil
+	return b, dec, precision, frac, nil
 }

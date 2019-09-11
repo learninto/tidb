@@ -15,69 +15,20 @@ package expression
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/util/charset"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-tipb"
-	goctx "golang.org/x/net/context"
 )
-
-// mockKvClient is mocked from tikv.CopClient to avoid circular dependency.
-type mockKvClient struct {
-}
-
-// IsRequestTypeSupported implements the kv.Client interface..
-func (c *mockKvClient) IsRequestTypeSupported(reqType, subType int64) bool {
-	switch reqType {
-	case kv.ReqTypeSelect, kv.ReqTypeIndex:
-		switch subType {
-		case kv.ReqSubTypeGroupBy, kv.ReqSubTypeBasic, kv.ReqSubTypeTopN:
-			return true
-		default:
-			return c.supportExpr(tipb.ExprType(subType))
-		}
-	}
-	return false
-}
-
-// Send implements the kv.Client interface..
-func (c *mockKvClient) Send(ctx goctx.Context, req *kv.Request) kv.Response {
-	return nil
-}
-
-func (c *mockKvClient) supportExpr(exprType tipb.ExprType) bool {
-	switch exprType {
-	case tipb.ExprType_Null, tipb.ExprType_Int64, tipb.ExprType_Uint64, tipb.ExprType_String, tipb.ExprType_Bytes,
-		tipb.ExprType_MysqlDuration, tipb.ExprType_MysqlTime, tipb.ExprType_MysqlDecimal,
-		tipb.ExprType_ColumnRef,
-		tipb.ExprType_And, tipb.ExprType_Or,
-		tipb.ExprType_LT, tipb.ExprType_LE, tipb.ExprType_EQ, tipb.ExprType_NE,
-		tipb.ExprType_GE, tipb.ExprType_GT, tipb.ExprType_NullEQ,
-		tipb.ExprType_In, tipb.ExprType_ValueList,
-		tipb.ExprType_Like, tipb.ExprType_Not:
-		return true
-	case tipb.ExprType_Plus, tipb.ExprType_Div:
-		return true
-	case tipb.ExprType_Case, tipb.ExprType_If:
-		return true
-	case tipb.ExprType_Count, tipb.ExprType_First, tipb.ExprType_Max, tipb.ExprType_Min, tipb.ExprType_Sum, tipb.ExprType_Avg:
-		return true
-	case tipb.ExprType_JsonType, tipb.ExprType_JsonExtract, tipb.ExprType_JsonUnquote, tipb.ExprType_JsonValid,
-		tipb.ExprType_JsonObject, tipb.ExprType_JsonArray, tipb.ExprType_JsonMerge, tipb.ExprType_JsonSet,
-		tipb.ExprType_JsonInsert, tipb.ExprType_JsonReplace, tipb.ExprType_JsonRemove, tipb.ExprType_JsonContains:
-		return false
-	case kv.ReqSubTypeDesc:
-		return true
-	default:
-		return false
-	}
-}
 
 type dataGen4Expr2PbTest struct {
 }
@@ -91,9 +42,10 @@ func (dg *dataGen4Expr2PbTest) genColumn(tp byte, id int64) *Column {
 }
 
 func (s *testEvaluatorSuite) TestConstant2Pb(c *C) {
+	c.Skip("constant pb has changed")
 	var constExprs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 
 	// can be transformed
 	constValue := new(Constant)
@@ -152,17 +104,17 @@ func (s *testEvaluatorSuite) TestConstant2Pb(c *C) {
 	c.Assert(len(remained), Equals, 3)
 	js, err := json.Marshal(pbExpr)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":0},{\"tp\":1,\"val\":\"gAAAAAAAAGQ=\"}]},{\"tp\":2,\"val\":\"AAAAAAAAAGQ=\"}]},{\"tp\":5,\"val\":\"MTAw\"}]},{\"tp\":6,\"val\":\"MTI0Yw==\"}]},{\"tp\":102,\"val\":\"AwCAbg==\"}]},{\"tp\":103,\"val\":\"gAAAAAAAAAA=\"}]}")
+	c.Assert(string(js), Equals, "{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":0,\"sig\":0},{\"tp\":1,\"val\":\"gAAAAAAAAGQ=\",\"sig\":0}],\"sig\":0},{\"tp\":2,\"val\":\"AAAAAAAAAGQ=\",\"sig\":0}],\"sig\":0},{\"tp\":5,\"val\":\"MTAw\",\"sig\":0}],\"sig\":0},{\"tp\":6,\"val\":\"MTI0Yw==\",\"sig\":0}],\"sig\":0},{\"tp\":102,\"val\":\"AwCAbg==\",\"sig\":0}],\"sig\":0},{\"tp\":103,\"val\":\"gAAAAAAAAAA=\",\"sig\":0}],\"sig\":0}")
 
 	pbExprs := ExpressionsToPBList(sc, constExprs, client)
 	jsons := []string{
-		"{\"tp\":0}",
-		"{\"tp\":1,\"val\":\"gAAAAAAAAGQ=\"}",
-		"{\"tp\":2,\"val\":\"AAAAAAAAAGQ=\"}",
-		"{\"tp\":5,\"val\":\"MTAw\"}",
-		"{\"tp\":6,\"val\":\"MTI0Yw==\"}",
-		"{\"tp\":102,\"val\":\"AwCAbg==\"}",
-		"{\"tp\":103,\"val\":\"gAAAAAAAAAA=\"}",
+		"{\"tp\":0,\"sig\":0}",
+		"{\"tp\":1,\"val\":\"gAAAAAAAAGQ=\",\"sig\":0}",
+		"{\"tp\":2,\"val\":\"AAAAAAAAAGQ=\",\"sig\":0}",
+		"{\"tp\":5,\"val\":\"MTAw\",\"sig\":0}",
+		"{\"tp\":6,\"val\":\"MTI0Yw==\",\"sig\":0}",
+		"{\"tp\":102,\"val\":\"AwCAbg==\",\"sig\":0}",
+		"{\"tp\":103,\"val\":\"gAAAAAAAAAA=\",\"sig\":0}",
 	}
 	for i, pbExpr := range pbExprs {
 		if i+3 < len(pbExprs) {
@@ -177,8 +129,8 @@ func (s *testEvaluatorSuite) TestConstant2Pb(c *C) {
 
 func (s *testEvaluatorSuite) TestColumn2Pb(c *C) {
 	var colExprs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeBit, 1))
@@ -212,7 +164,6 @@ func (s *testEvaluatorSuite) TestColumn2Pb(c *C) {
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeDuration, 11))
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeDatetime, 12))
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeYear, 13))
-	colExprs = append(colExprs, dg.genColumn(mysql.TypeNewDate, 14))
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeVarchar, 15))
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeJSON, 16))
 	colExprs = append(colExprs, dg.genColumn(mysql.TypeNewDecimal, 17))
@@ -227,39 +178,37 @@ func (s *testEvaluatorSuite) TestColumn2Pb(c *C) {
 	c.Assert(len(remained), Equals, 0)
 	js, err := json.Marshal(pbExpr)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAQ=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAU=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAY=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAc=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAg=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAk=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAo=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAs=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAAw=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAA0=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAA4=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAAA8=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABA=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABE=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABI=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABM=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABQ=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABU=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABY=\"}]},{\"tp\":201,\"val\":\"gAAAAAAAABc=\"}]}")
-
+	c.Assert(string(js), Equals, "{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":2,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAQ=\",\"sig\":0,\"field_type\":{\"tp\":4,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAU=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAY=\",\"sig\":0,\"field_type\":{\"tp\":6,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAc=\",\"sig\":0,\"field_type\":{\"tp\":7,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAg=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAk=\",\"sig\":0,\"field_type\":{\"tp\":9,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAo=\",\"sig\":0,\"field_type\":{\"tp\":10,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAs=\",\"sig\":0,\"field_type\":{\"tp\":11,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAw=\",\"sig\":0,\"field_type\":{\"tp\":12,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAA0=\",\"sig\":0,\"field_type\":{\"tp\":13,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAA8=\",\"sig\":0,\"field_type\":{\"tp\":15,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABA=\",\"sig\":0,\"field_type\":{\"tp\":245,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABE=\",\"sig\":0,\"field_type\":{\"tp\":246,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABI=\",\"sig\":0,\"field_type\":{\"tp\":249,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABM=\",\"sig\":0,\"field_type\":{\"tp\":250,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABQ=\",\"sig\":0,\"field_type\":{\"tp\":251,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABU=\",\"sig\":0,\"field_type\":{\"tp\":252,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABY=\",\"sig\":0,\"field_type\":{\"tp\":253,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAABc=\",\"sig\":0,\"field_type\":{\"tp\":254,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}")
 	pbExprs = ExpressionsToPBList(sc, colExprs, client)
 	jsons := []string{
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAM=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAQ=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAU=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAY=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAc=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAg=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAk=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAo=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAs=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAAw=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAA0=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAA4=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAAA8=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABA=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABE=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABI=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABM=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABQ=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABU=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABY=\"}",
-		"{\"tp\":201,\"val\":\"gAAAAAAAABc=\"}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":2,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAM=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAQ=\",\"sig\":0,\"field_type\":{\"tp\":4,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAU=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAY=\",\"sig\":0,\"field_type\":{\"tp\":6,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAc=\",\"sig\":0,\"field_type\":{\"tp\":7,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAg=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAk=\",\"sig\":0,\"field_type\":{\"tp\":9,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAo=\",\"sig\":0,\"field_type\":{\"tp\":10,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAs=\",\"sig\":0,\"field_type\":{\"tp\":11,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAAw=\",\"sig\":0,\"field_type\":{\"tp\":12,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAA0=\",\"sig\":0,\"field_type\":{\"tp\":13,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAAA8=\",\"sig\":0,\"field_type\":{\"tp\":15,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABA=\",\"sig\":0,\"field_type\":{\"tp\":245,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABE=\",\"sig\":0,\"field_type\":{\"tp\":246,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABI=\",\"sig\":0,\"field_type\":{\"tp\":249,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABM=\",\"sig\":0,\"field_type\":{\"tp\":250,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABQ=\",\"sig\":0,\"field_type\":{\"tp\":251,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABU=\",\"sig\":0,\"field_type\":{\"tp\":252,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABY=\",\"sig\":0,\"field_type\":{\"tp\":253,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":201,\"val\":\"gAAAAAAAABc=\",\"sig\":0,\"field_type\":{\"tp\":254,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
 	}
 	for i, pbExpr := range pbExprs {
 		c.Assert(pbExprs, NotNil)
-		js, err := json.Marshal(pbExpr)
+		js, err = json.Marshal(pbExpr)
 		c.Assert(err, IsNil)
-		c.Assert(string(js), Equals, jsons[i])
+		c.Assert(string(js), Equals, jsons[i], Commentf("%v\n", i))
 	}
 
 	for _, expr := range colExprs {
@@ -267,20 +216,18 @@ func (s *testEvaluatorSuite) TestColumn2Pb(c *C) {
 		expr.(*Column).Index = 0
 	}
 	pbExpr, pushed, remained = ExpressionsToPB(sc, colExprs, client)
-	c.Assert(pbExpr, IsNil)
-	c.Assert(len(pushed), Equals, 0)
-	c.Assert(len(remained), Equals, len(colExprs))
-
-	pbExprs = ExpressionsToPBList(sc, colExprs, client)
-	for _, pbExpr := range pbExprs {
-		c.Assert(pbExpr, IsNil)
-	}
+	c.Assert(pbExpr, NotNil)
+	js, err = json.Marshal(pbExpr)
+	c.Assert(err, IsNil)
+	c.Assert(string(js), Equals, "{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":2,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":4,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":6,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":7,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":9,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":10,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":11,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":12,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":13,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":15,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":245,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":246,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":249,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":250,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":251,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":252,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":253,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":254,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}")
+	c.Assert(len(pushed), Equals, len(colExprs))
+	c.Assert(len(remained), Equals, 0)
 }
 
 func (s *testEvaluatorSuite) TestCompareFunc2Pb(c *C) {
-	var compareExprs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var compareExprs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{ast.LT, ast.LE, ast.GT, ast.GE, ast.EQ, ast.NE, ast.NullEQ}
@@ -296,18 +243,18 @@ func (s *testEvaluatorSuite) TestCompareFunc2Pb(c *C) {
 	c.Assert(len(remained), Equals, 0)
 	js, err := json.Marshal(pbExpr)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2301,\"children\":[{\"tp\":2001,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]},{\"tp\":2002,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]},{\"tp\":2006,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]},{\"tp\":2005,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]},{\"tp\":2003,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]},{\"tp\":2004,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]},{\"tp\":2007,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}]}")
+	c.Assert(string(js), Equals, "{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":100,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":110,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":120,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":130,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":140,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":150,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}},{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":160,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}")
 
 	pbExprs := ExpressionsToPBList(sc, compareExprs, client)
 	c.Assert(len(pbExprs), Equals, len(compareExprs))
 	jsons := []string{
-		"{\"tp\":2001,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2002,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2006,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2005,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2003,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2004,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2007,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":100,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":110,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":120,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":130,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":140,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":150,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":8,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":160,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
 	}
 	for i, pbExpr := range pbExprs {
 		c.Assert(pbExprs, NotNil)
@@ -317,57 +264,10 @@ func (s *testEvaluatorSuite) TestCompareFunc2Pb(c *C) {
 	}
 }
 
-func (s *testEvaluatorSuite) TestInFunc2Pb(c *C) {
-	var (
-		compareExprs []Expression
-		args         []Expression
-	)
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
-	dg := new(dataGen4Expr2PbTest)
-
-	args = append(args, dg.genColumn(mysql.TypeLonglong, 1))
-	args = append(args, &Constant{RetType: nil, Value: types.NewDatum(nil)})
-	c.Assert(args[len(args)-1].(*Constant).Value.Kind(), Equals, types.KindNull)
-	args = append(args, &Constant{RetType: nil, Value: types.NewDatum(uint64(100))})
-	c.Assert(args[len(args)-1].(*Constant).Value.Kind(), Equals, types.KindUint64)
-	args = append(args, &Constant{RetType: nil, Value: types.NewDatum("100")})
-	c.Assert(args[len(args)-1].(*Constant).Value.Kind(), Equals, types.KindString)
-
-	fc, err := NewFunction(mock.NewContext(), ast.In, types.NewFieldType(mysql.TypeUnspecified), args...)
-	c.Assert(err, IsNil)
-	compareExprs = append(compareExprs, fc)
-
-	pbExpr, pushed, remained := ExpressionsToPB(sc, compareExprs, client)
-	c.Assert(pbExpr, IsNil)
-	c.Assert(len(pushed), Equals, 0)
-	c.Assert(len(remained), Equals, 1)
-
-	pbExprs := ExpressionsToPBList(sc, compareExprs, client)
-	c.Assert(len(pbExprs), Equals, 1)
-	c.Assert(pbExprs[0], IsNil)
-
-	args = args[:3]
-	args = append(args, &Constant{RetType: nil, Value: types.NewDatum(uint64(200))})
-	c.Assert(args[len(args)-1].(*Constant).Value.Kind(), Equals, types.KindUint64)
-
-	fc, err = NewFunction(mock.NewContext(), ast.In, types.NewFieldType(mysql.TypeUnspecified), args...)
-	c.Assert(err, IsNil)
-	compareExprs[0] = fc
-
-	pbExpr, pushed, remained = ExpressionsToPB(sc, compareExprs, client)
-	c.Assert(pbExpr, NotNil)
-	c.Assert(len(pushed), Equals, 1)
-	c.Assert(len(remained), Equals, 0)
-	js, err := json.Marshal(pbExpr)
-	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "{\"tp\":4001,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":151,\"val\":\"AAlkCcgB\"}]}")
-}
-
 func (s *testEvaluatorSuite) TestLikeFunc2Pb(c *C) {
 	var likeFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 
 	retTp := types.NewFieldType(mysql.TypeString)
 	retTp.Charset = charset.CharsetUTF8
@@ -375,7 +275,7 @@ func (s *testEvaluatorSuite) TestLikeFunc2Pb(c *C) {
 	args := []Expression{
 		&Constant{RetType: retTp, Value: types.NewDatum("string")},
 		&Constant{RetType: retTp, Value: types.NewDatum("pattern")},
-		&Constant{RetType: retTp, Value: types.NewDatum("%abc%")},
+		&Constant{RetType: retTp, Value: types.NewDatum(`%abc%`)},
 		&Constant{RetType: retTp, Value: types.NewDatum("\\")},
 	}
 	ctx := mock.NewContext()
@@ -397,9 +297,9 @@ func (s *testEvaluatorSuite) TestLikeFunc2Pb(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestArithmeticalFunc2Pb(c *C) {
-	var arithmeticalFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var arithmeticalFuncs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{ast.Plus, ast.Minus, ast.Mul, ast.Div, ast.Mod, ast.IntDiv}
@@ -408,34 +308,55 @@ func (s *testEvaluatorSuite) TestArithmeticalFunc2Pb(c *C) {
 			mock.NewContext(),
 			funcName,
 			types.NewFieldType(mysql.TypeUnspecified),
-			dg.genColumn(mysql.TypeLonglong, 1),
-			dg.genColumn(mysql.TypeLonglong, 2))
+			dg.genColumn(mysql.TypeDouble, 1),
+			dg.genColumn(mysql.TypeDouble, 2))
 		c.Assert(err, IsNil)
 		arithmeticalFuncs = append(arithmeticalFuncs, fc)
 	}
 
 	jsons := make(map[string]string)
-	jsons[ast.Plus] = "{\"tp\":2201,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}"
-	jsons[ast.Div] = "{\"tp\":2204,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}"
+	jsons[ast.Plus] = "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":200,\"field_type\":{\"tp\":5,\"flag\":128,\"flen\":-1,\"decimal\":-1,\"collate\":63,\"charset\":\"binary\"}}"
+	jsons[ast.Minus] = "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":204,\"field_type\":{\"tp\":5,\"flag\":128,\"flen\":-1,\"decimal\":-1,\"collate\":63,\"charset\":\"binary\"}}"
+	jsons[ast.Mul] = "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":208,\"field_type\":{\"tp\":5,\"flag\":128,\"flen\":-1,\"decimal\":-1,\"collate\":63,\"charset\":\"binary\"}}"
+	jsons[ast.Div] = "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":211,\"field_type\":{\"tp\":5,\"flag\":128,\"flen\":23,\"decimal\":31,\"collate\":63,\"charset\":\"binary\"}}"
 
 	pbExprs := ExpressionsToPBList(sc, arithmeticalFuncs, client)
 	for i, pbExpr := range pbExprs {
 		switch funcNames[i] {
-		case ast.Plus, ast.Div:
+		case ast.Mod, ast.IntDiv:
+			c.Assert(pbExpr, IsNil, Commentf("%v\n", funcNames[i]))
+		default:
 			c.Assert(pbExpr, NotNil)
 			js, err := json.Marshal(pbExpr)
 			c.Assert(err, IsNil)
-			c.Assert(string(js), Equals, jsons[funcNames[i]])
-		default:
-			c.Assert(pbExpr, IsNil)
+			c.Assert(string(js), Equals, jsons[funcNames[i]], Commentf("%v\n", funcNames[i]))
 		}
 	}
 }
 
+func (s *testEvaluatorSuite) TestDateFunc2Pb(c *C) {
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
+	dg := new(dataGen4Expr2PbTest)
+	fc, err := NewFunction(
+		mock.NewContext(),
+		ast.DateFormat,
+		types.NewFieldType(mysql.TypeUnspecified),
+		dg.genColumn(mysql.TypeDatetime, 1),
+		dg.genColumn(mysql.TypeString, 2))
+	c.Assert(err, IsNil)
+	funcs := []Expression{fc}
+	pbExprs := ExpressionsToPBList(sc, funcs, client)
+	c.Assert(pbExprs[0], NotNil)
+	js, err := json.Marshal(pbExprs[0])
+	c.Assert(err, IsNil)
+	c.Assert(string(js), Equals, "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":12,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":254,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":6001,\"field_type\":{\"tp\":253,\"flag\":0,\"flen\":0,\"decimal\":-1,\"collate\":46,\"charset\":\"utf8mb4\"}}")
+}
+
 func (s *testEvaluatorSuite) TestLogicalFunc2Pb(c *C) {
-	var logicalFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var logicalFuncs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{ast.LogicAnd, ast.LogicOr, ast.LogicXor, ast.UnaryNot}
@@ -456,10 +377,10 @@ func (s *testEvaluatorSuite) TestLogicalFunc2Pb(c *C) {
 
 	pbExprs := ExpressionsToPBList(sc, logicalFuncs, client)
 	jsons := []string{
-		"{\"tp\":2301,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
-		"{\"tp\":2302,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"}]}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3101,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3102,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
 		"null",
-		"{\"tp\":1001,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":1,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3104,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
 	}
 	for i, pbExpr := range pbExprs {
 		js, err := json.Marshal(pbExpr)
@@ -469,9 +390,9 @@ func (s *testEvaluatorSuite) TestLogicalFunc2Pb(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestBitwiseFunc2Pb(c *C) {
-	var bitwiseFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var bitwiseFuncs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{ast.And, ast.Or, ast.Xor, ast.LeftShift, ast.RightShift, ast.BitNeg}
@@ -498,17 +419,81 @@ func (s *testEvaluatorSuite) TestBitwiseFunc2Pb(c *C) {
 	}
 }
 
+func (s *testEvaluatorSuite) TestPushDownSwitcher(c *C) {
+	var funcs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
+	dg := new(dataGen4Expr2PbTest)
+
+	cases := []struct {
+		name   string
+		sig    tipb.ScalarFuncSig
+		enable bool
+	}{
+		{ast.And, tipb.ScalarFuncSig_BitAndSig, true},
+		{ast.Or, tipb.ScalarFuncSig_BitOrSig, false},
+		{ast.UnaryNot, tipb.ScalarFuncSig_UnaryNotInt, true},
+	}
+	var enabled []string
+	for i, funcName := range cases {
+		args := []Expression{dg.genColumn(mysql.TypeLong, 1)}
+		if i+1 < len(cases) {
+			args = append(args, dg.genColumn(mysql.TypeLong, 2))
+		}
+		fc, err := NewFunction(
+			mock.NewContext(),
+			funcName.name,
+			types.NewFieldType(mysql.TypeUnspecified),
+			args...,
+		)
+		c.Assert(err, IsNil)
+		funcs = append(funcs, fc)
+		if funcName.enable {
+			enabled = append(enabled, funcName.name)
+		}
+	}
+
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/expression/PushDownTestSwitcher", `return("all")`), IsNil)
+	defer func() { c.Assert(failpoint.Disable("github.com/pingcap/tidb/expression/PushDownTestSwitcher"), IsNil) }()
+
+	pbExprs := ExpressionsToPBList(sc, funcs, client)
+	c.Assert(len(pbExprs), Equals, len(cases))
+	for i, pbExpr := range pbExprs {
+		c.Assert(pbExpr.Sig, Equals, cases[i].sig, Commentf("function: %s, sig: %v", cases[i].name, cases[i].sig))
+	}
+
+	// All disabled
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/expression/PushDownTestSwitcher", `return("")`), IsNil)
+	pbExprs = ExpressionsToPBList(sc, funcs, client)
+	c.Assert(len(pbExprs), Equals, len(cases))
+	for i, pbExpr := range pbExprs {
+		c.Assert(pbExpr, IsNil, Commentf("function: %s, sig: %v", cases[i].name, cases[i].sig))
+	}
+
+	// Partial enabled
+	fpexpr := fmt.Sprintf(`return("%s")`, strings.Join(enabled, ","))
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/expression/PushDownTestSwitcher", fpexpr), IsNil)
+	pbExprs = ExpressionsToPBList(sc, funcs, client)
+	c.Assert(len(pbExprs), Equals, len(cases))
+	for i, pbExpr := range pbExprs {
+		if !cases[i].enable {
+			c.Assert(pbExpr, IsNil, Commentf("function: %s, sig: %v", cases[i].name, cases[i].sig))
+			continue
+		}
+		c.Assert(pbExpr.Sig, Equals, cases[i].sig, Commentf("function: %s, sig: %v", cases[i].name, cases[i].sig))
+	}
+}
+
 func (s *testEvaluatorSuite) TestControlFunc2Pb(c *C) {
-	var controlFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var controlFuncs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{
 		ast.Case,
 		ast.If,
 		ast.Ifnull,
-		ast.Nullif,
 	}
 	for i, funcName := range funcNames {
 		args := []Expression{dg.genColumn(mysql.TypeLong, 1)}
@@ -528,9 +513,9 @@ func (s *testEvaluatorSuite) TestControlFunc2Pb(c *C) {
 
 	pbExprs := ExpressionsToPBList(sc, controlFuncs, client)
 	jsons := []string{
-		"{\"tp\":4007,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\"}]}",
-		"{\"tp\":3301,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\"},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\"}]}",
-		"null",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":4208,\"field_type\":{\"tp\":3,\"flag\":128,\"flen\":0,\"decimal\":0,\"collate\":46,\"charset\":\"\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAM=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":4107,\"field_type\":{\"tp\":3,\"flag\":128,\"flen\":-1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+		"{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},{\"tp\":201,\"val\":\"gAAAAAAAAAI=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":4101,\"field_type\":{\"tp\":3,\"flag\":128,\"flen\":-1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
 		"null",
 	}
 	for i, pbExpr := range pbExprs {
@@ -541,9 +526,9 @@ func (s *testEvaluatorSuite) TestControlFunc2Pb(c *C) {
 }
 
 func (s *testEvaluatorSuite) TestOtherFunc2Pb(c *C) {
-	var otherFuncs []Expression
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	var otherFuncs = make([]Expression, 0)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
 	funcNames := []string{ast.Coalesce, ast.IsNull}
@@ -559,87 +544,91 @@ func (s *testEvaluatorSuite) TestOtherFunc2Pb(c *C) {
 	}
 
 	pbExprs := ExpressionsToPBList(sc, otherFuncs, client)
-	for _, pbExpr := range pbExprs {
+	jsons := map[string]string{
+		ast.Coalesce: "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":4201,\"field_type\":{\"tp\":3,\"flag\":128,\"flen\":0,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}",
+		ast.IsNull:   "{\"tp\":10000,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":3,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}}],\"sig\":3116,\"field_type\":{\"tp\":8,\"flag\":128,\"flen\":1,\"decimal\":0,\"collate\":63,\"charset\":\"binary\"}}",
+	}
+	for i, pbExpr := range pbExprs {
 		js, err := json.Marshal(pbExpr)
 		c.Assert(err, IsNil)
-		c.Assert(string(js), Equals, "null")
+		c.Assert(string(js), Equals, jsons[funcNames[i]])
 	}
 }
 
 func (s *testEvaluatorSuite) TestGroupByItem2Pb(c *C) {
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 	item := dg.genColumn(mysql.TypeDouble, 0)
 	pbByItem := GroupByItemToPB(sc, client, item)
 	js, err := json.Marshal(pbByItem)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "null")
+	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},\"desc\":false}")
 
 	item = dg.genColumn(mysql.TypeDouble, 1)
 	pbByItem = GroupByItemToPB(sc, client, item)
 	js, err = json.Marshal(pbByItem)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"},\"desc\":false}")
+	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},\"desc\":false}")
 }
 
 func (s *testEvaluatorSuite) TestSortByItem2Pb(c *C) {
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 	item := dg.genColumn(mysql.TypeDouble, 0)
 	pbByItem := SortByItemToPB(sc, client, item, false)
 	js, err := json.Marshal(pbByItem)
 	c.Assert(err, IsNil)
-	c.Assert(string(js), Equals, "null")
+	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAA=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},\"desc\":false}")
 
 	item = dg.genColumn(mysql.TypeDouble, 1)
 	pbByItem = SortByItemToPB(sc, client, item, false)
 	js, err = json.Marshal(pbByItem)
 	c.Assert(err, IsNil)
+	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},\"desc\":false}")
 
 	item = dg.genColumn(mysql.TypeDouble, 1)
 	pbByItem = SortByItemToPB(sc, client, item, true)
 	js, err = json.Marshal(pbByItem)
 	c.Assert(err, IsNil)
+	c.Assert(string(js), Equals, "{\"expr\":{\"tp\":201,\"val\":\"gAAAAAAAAAE=\",\"sig\":0,\"field_type\":{\"tp\":5,\"flag\":0,\"flen\":-1,\"decimal\":-1,\"collate\":46,\"charset\":\"\"}},\"desc\":true}")
 }
 
-func (s *testEvaluatorSuite) TestAggFunc2Pb(c *C) {
-	sc := new(variable.StatementContext)
-	client := new(mockKvClient)
+func (s *testEvaluatorSuite) TestImplicitArgs(c *C) {
+	sc := new(stmtctx.StatementContext)
+	client := new(mock.Client)
 	dg := new(dataGen4Expr2PbTest)
 
-	funcNames := []string{ast.AggFuncSum, ast.AggFuncCount, ast.AggFuncAvg, ast.AggFuncGroupConcat, ast.AggFuncMax, ast.AggFuncMin, ast.AggFuncFirstRow}
-	for _, funcName := range funcNames {
-		aggFunc := NewAggFunction(
-			funcName,
-			[]Expression{dg.genColumn(mysql.TypeDouble, 1)},
-			true,
-		)
-		pbExpr := AggFuncToPBExpr(sc, client, aggFunc)
-		js, err := json.Marshal(pbExpr)
-		c.Assert(err, IsNil)
-		c.Assert(string(js), Equals, "null")
-	}
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/expression/PushDownTestSwitcher", `return("all")`), IsNil)
+	defer func() { c.Assert(failpoint.Disable("github.com/pingcap/tidb/expression/PushDownTestSwitcher"), IsNil) }()
 
-	jsons := []string{
-		"{\"tp\":3002,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-		"{\"tp\":3001,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-		"{\"tp\":3003,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-		"null",
-		"{\"tp\":3005,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-		"{\"tp\":3004,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-		"{\"tp\":3006,\"children\":[{\"tp\":201,\"val\":\"gAAAAAAAAAE=\"}]}",
-	}
-	for i, funcName := range funcNames {
-		aggFunc := NewAggFunction(
-			funcName,
-			[]Expression{dg.genColumn(mysql.TypeDouble, 1)},
-			false,
-		)
-		pbExpr := AggFuncToPBExpr(sc, client, aggFunc)
-		js, err := json.Marshal(pbExpr)
-		c.Assert(err, IsNil)
-		c.Assert(string(js), Equals, jsons[i])
-	}
+	pc := PbConverter{client: client, sc: sc}
+
+	// InUnion flag is false in `BuildCastFunction` when `ScalarFuncSig_CastStringAsInt`
+	cast := BuildCastFunction(mock.NewContext(), dg.genColumn(mysql.TypeString, 1), types.NewFieldType(mysql.TypeLonglong))
+	c.Assert(cast.(*ScalarFunction).Function.implicitArgs(), DeepEquals, []types.Datum{types.NewIntDatum(0)})
+	expr := pc.ExprToPB(cast)
+	c.Assert(expr.Sig, Equals, tipb.ScalarFuncSig_CastStringAsInt)
+	c.Assert(len(expr.Val), Greater, 0)
+	datums, err := codec.Decode(expr.Val, 1)
+	c.Assert(err, IsNil)
+	c.Assert(datums, DeepEquals, []types.Datum{types.NewIntDatum(0)})
+
+	// InUnion flag is nil in `BuildCastFunction4Union` when `ScalarFuncSig_CastIntAsString`
+	castInUnion := BuildCastFunction4Union(mock.NewContext(), dg.genColumn(mysql.TypeLonglong, 1), types.NewFieldType(mysql.TypeString))
+	c.Assert(castInUnion.(*ScalarFunction).Function.implicitArgs(), IsNil)
+	expr = pc.ExprToPB(castInUnion)
+	c.Assert(expr.Sig, Equals, tipb.ScalarFuncSig_CastIntAsString)
+	c.Assert(len(expr.Val), Equals, 0)
+
+	// InUnion flag is true in `BuildCastFunction4Union` when `ScalarFuncSig_CastStringAsInt`
+	castInUnion = BuildCastFunction4Union(mock.NewContext(), dg.genColumn(mysql.TypeString, 1), types.NewFieldType(mysql.TypeLonglong))
+	c.Assert(castInUnion.(*ScalarFunction).Function.implicitArgs(), DeepEquals, []types.Datum{types.NewIntDatum(1)})
+	expr = pc.ExprToPB(castInUnion)
+	c.Assert(expr.Sig, Equals, tipb.ScalarFuncSig_CastStringAsInt)
+	c.Assert(len(expr.Val), Greater, 0)
+	datums, err = codec.Decode(expr.Val, 1)
+	c.Assert(err, IsNil)
+	c.Assert(datums, DeepEquals, []types.Datum{types.NewIntDatum(1)})
 }

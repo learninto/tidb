@@ -14,15 +14,14 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
-	goctx "golang.org/x/net/context"
+	"github.com/pingcap/tidb/types"
 )
 
 type testCtxKeyType int
@@ -34,11 +33,14 @@ func (k testCtxKeyType) String() string {
 const testCtxKey testCtxKeyType = 0
 
 func (s *testDDLSuite) TestReorg(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_reorg")
 	defer store.Close()
 
-	d := testNewDDL(goctx.Background(), nil, store, nil, nil, testLease)
+	d := newDDL(
+		context.Background(),
+		WithStore(store),
+		WithLease(testLease),
+	)
 	defer d.Stop()
 
 	time.Sleep(testLease)
@@ -49,64 +51,99 @@ func (s *testDDLSuite) TestReorg(c *C) {
 	c.Assert(ctx.Value(testCtxKey), Equals, 1)
 	ctx.ClearValue(testCtxKey)
 
-	err := ctx.NewTxn()
+	err := ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
-	ctx.Txn().Set([]byte("a"), []byte("b"))
-	err = ctx.Txn().Rollback()
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Set([]byte("a"), []byte("b"))
+	c.Assert(err, IsNil)
+	err = txn.Rollback()
 	c.Assert(err, IsNil)
 
-	err = ctx.NewTxn()
+	err = ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
-	ctx.Txn().Set([]byte("a"), []byte("b"))
-	err = ctx.Txn().Commit()
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Set([]byte("a"), []byte("b"))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
 	rowCount := int64(10)
+	handle := int64(100)
 	f := func() error {
-		d.setReorgRowCount(rowCount)
-		time.Sleep(4 * testLease)
+		d.generalWorker().reorgCtx.setRowCount(rowCount)
+		d.generalWorker().reorgCtx.setNextHandle(handle)
+		time.Sleep(1*ReorgWaitTimeout + 100*time.Millisecond)
 		return nil
 	}
-	job := &model.Job{}
-	err = d.runReorgJob(job, f)
+	job := &model.Job{
+		ID:          1,
+		SnapshotVer: 1, // Make sure it is not zero. So the reorgInfo's first is false.
+	}
+	err = ctx.NewTxn(context.Background())
+	c.Assert(err, IsNil)
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	rInfo := &reorgInfo{
+		Job: job,
+	}
+	err = d.generalWorker().runReorgJob(m, rInfo, d.lease, f)
 	c.Assert(err, NotNil)
 
 	// The longest to wait for 5 seconds to make sure the function of f is returned.
 	for i := 0; i < 1000; i++ {
 		time.Sleep(5 * time.Millisecond)
-		err = d.runReorgJob(job, f)
+		err = d.generalWorker().runReorgJob(m, rInfo, d.lease, f)
 		if err == nil {
 			c.Assert(job.RowCount, Equals, rowCount)
-			c.Assert(d.reorgRowCount, Equals, int64(0))
+			c.Assert(d.generalWorker().reorgCtx.rowCount, Equals, int64(0))
+
+			// Test whether reorgInfo's Handle is update.
+			err = txn.Commit(context.Background())
+			c.Assert(err, IsNil)
+			err = ctx.NewTxn(context.Background())
+			c.Assert(err, IsNil)
+
+			m = meta.NewMeta(txn)
+			info, err1 := getReorgInfo(d.ddlCtx, m, job, nil)
+			c.Assert(err1, IsNil)
+			c.Assert(info.StartHandle, Equals, handle)
+			c.Assert(d.generalWorker().reorgCtx.doneHandle, Equals, int64(0))
 			break
 		}
 	}
 	c.Assert(err, IsNil)
 
 	d.Stop()
-	err = d.runReorgJob(job, func() error {
+	err = d.generalWorker().runReorgJob(m, rInfo, d.lease, func() error {
 		time.Sleep(4 * testLease)
 		return nil
 	})
 	c.Assert(err, NotNil)
-	d.start(goctx.Background())
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
 
+	d.start(context.Background(), nil)
 	job = &model.Job{
-		ID:       1,
-		SchemaID: 1,
-		Type:     model.ActionCreateSchema,
-		Args:     []interface{}{model.NewCIStr("test")},
+		ID:          2,
+		SchemaID:    1,
+		Type:        model.ActionCreateSchema,
+		Args:        []interface{}{model.NewCIStr("test")},
+		SnapshotVer: 1, // Make sure it is not zero. So the reorgInfo's first is false.
 	}
 
 	var info *reorgInfo
 	err = kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err1 error
-		info, err1 = d.getReorgInfo(t, job)
+		info, err1 = getReorgInfo(d.ddlCtx, t, job, nil)
 		c.Assert(err1, IsNil)
-		err1 = info.UpdateHandle(txn, 1)
+		err1 = info.UpdateReorgMeta(txn, 1, 0, 0)
 		c.Assert(err1, IsNil)
-
 		return nil
 	})
 	c.Assert(err, IsNil)
@@ -114,27 +151,34 @@ func (s *testDDLSuite) TestReorg(c *C) {
 	err = kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err1 error
-		info, err1 = d.getReorgInfo(t, job)
+		info, err1 = getReorgInfo(d.ddlCtx, t, job, nil)
 		c.Assert(err1, IsNil)
-		c.Assert(info.Handle, Greater, int64(0))
+		c.Assert(info.StartHandle, Greater, int64(0))
 		return nil
 	})
 	c.Assert(err, IsNil)
 }
 
 func (s *testDDLSuite) TestReorgOwner(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_reorg_owner")
 	defer store.Close()
 
-	d1 := testNewDDL(goctx.Background(), nil, store, nil, nil, testLease)
+	d1 := newDDL(
+		context.Background(),
+		WithStore(store),
+		WithLease(testLease),
+	)
 	defer d1.Stop()
 
 	ctx := testNewContext(d1)
 
 	testCheckOwner(c, d1, true)
 
-	d2 := testNewDDL(goctx.Background(), nil, store, nil, nil, testLease)
+	d2 := newDDL(
+		context.Background(),
+		WithStore(store),
+		WithLease(testLease),
+	)
 	defer d2.Stop()
 
 	dbInfo := testSchemaInfo(c, d1, "test")
@@ -150,7 +194,9 @@ func (s *testDDLSuite) TestReorgOwner(c *C) {
 		c.Assert(err, IsNil)
 	}
 
-	err := ctx.Txn().Commit()
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
 	tc := &TestDDLCallback{}

@@ -17,22 +17,23 @@ import (
 	"fmt"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func (s *testEvaluatorSuite) TestColumn(c *C) {
 	defer testleak.AfterTest(c)()
 
-	sc := s.ctx.GetSessionVars().StmtCtx
+	col := &Column{RetType: types.NewFieldType(mysql.TypeLonglong), UniqueID: 1}
 
-	col := &Column{RetType: types.NewFieldType(mysql.TypeLonglong), FromID: "DataSource_0", Position: 0}
-	c.Assert(col.Equal(col, nil), IsTrue)
-	c.Assert(col.Equal(&Column{FromID: "Projection_0"}, nil), IsFalse)
+	c.Assert(col.Equal(nil, col), IsTrue)
+	c.Assert(col.Equal(nil, &Column{}), IsFalse)
 	c.Assert(col.IsCorrelated(), IsFalse)
-	c.Assert(col.Equal(col.Decorrelate(nil), nil), IsTrue)
+	c.Assert(col.Equal(nil, col.Decorrelate(nil)), IsTrue)
 
 	marshal, err := col.MarshalJSON()
 	c.Assert(err, IsNil)
@@ -40,17 +41,18 @@ func (s *testEvaluatorSuite) TestColumn(c *C) {
 
 	intDatum := types.NewIntDatum(1)
 	corCol := &CorrelatedColumn{Column: *col, Data: &intDatum}
-	invalidCorCol := &CorrelatedColumn{Column: Column{FromID: "Projection_0"}}
-	schema := &Schema{Columns: []*Column{{FromID: "DataSource_0", Position: 0}}}
-	c.Assert(corCol.Equal(corCol, nil), IsTrue)
-	c.Assert(corCol.Equal(invalidCorCol, nil), IsFalse)
+	invalidCorCol := &CorrelatedColumn{Column: Column{}}
+	schema := NewSchema(&Column{UniqueID: 1})
+	c.Assert(corCol.Equal(nil, corCol), IsTrue)
+	c.Assert(corCol.Equal(nil, invalidCorCol), IsFalse)
 	c.Assert(corCol.IsCorrelated(), IsTrue)
-	c.Assert(corCol.Decorrelate(schema).Equal(col, nil), IsTrue)
-	c.Assert(invalidCorCol.Decorrelate(schema).Equal(invalidCorCol, nil), IsTrue)
+	c.Assert(corCol.ConstItem(), IsFalse)
+	c.Assert(corCol.Decorrelate(schema).Equal(nil, col), IsTrue)
+	c.Assert(invalidCorCol.Decorrelate(schema).Equal(nil, invalidCorCol), IsTrue)
 
 	intCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeLonglong)},
 		Data: &intDatum}
-	intVal, isNull, err := intCorCol.EvalInt(nil, sc)
+	intVal, isNull, err := intCorCol.EvalInt(s.ctx, chunk.Row{})
 	c.Assert(intVal, Equals, int64(1))
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
@@ -58,7 +60,7 @@ func (s *testEvaluatorSuite) TestColumn(c *C) {
 	realDatum := types.NewFloat64Datum(1.2)
 	realCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeDouble)},
 		Data: &realDatum}
-	realVal, isNull, err := realCorCol.EvalReal(nil, sc)
+	realVal, isNull, err := realCorCol.EvalReal(s.ctx, chunk.Row{})
 	c.Assert(realVal, Equals, float64(1.2))
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
@@ -66,7 +68,7 @@ func (s *testEvaluatorSuite) TestColumn(c *C) {
 	decimalDatum := types.NewDecimalDatum(types.NewDecFromStringForTest("1.2"))
 	decimalCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeNewDecimal)},
 		Data: &decimalDatum}
-	decVal, isNull, err := decimalCorCol.EvalDecimal(nil, sc)
+	decVal, isNull, err := decimalCorCol.EvalDecimal(s.ctx, chunk.Row{})
 	c.Assert(decVal.Compare(types.NewDecFromStringForTest("1.2")), Equals, 0)
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
@@ -74,14 +76,14 @@ func (s *testEvaluatorSuite) TestColumn(c *C) {
 	stringDatum := types.NewStringDatum("abc")
 	stringCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeVarchar)},
 		Data: &stringDatum}
-	strVal, isNull, err := stringCorCol.EvalString(nil, sc)
+	strVal, isNull, err := stringCorCol.EvalString(s.ctx, chunk.Row{})
 	c.Assert(strVal, Equals, "abc")
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
 
 	durationCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeDuration)},
 		Data: &durationDatum}
-	durationVal, isNull, err := durationCorCol.EvalDuration(nil, sc)
+	durationVal, isNull, err := durationCorCol.EvalDuration(s.ctx, chunk.Row{})
 	c.Assert(durationVal.Compare(duration), Equals, 0)
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
@@ -89,10 +91,24 @@ func (s *testEvaluatorSuite) TestColumn(c *C) {
 	timeDatum := types.NewTimeDatum(tm)
 	timeCorCol := &CorrelatedColumn{Column: Column{RetType: types.NewFieldType(mysql.TypeDatetime)},
 		Data: &timeDatum}
-	timeVal, isNull, err := timeCorCol.EvalTime(nil, sc)
+	timeVal, isNull, err := timeCorCol.EvalTime(s.ctx, chunk.Row{})
 	c.Assert(timeVal.Compare(tm), Equals, 0)
 	c.Assert(isNull, IsFalse)
 	c.Assert(err, IsNil)
+}
+
+func (s *testEvaluatorSuite) TestColumnHashCode(c *C) {
+	defer testleak.AfterTest(c)()
+
+	col1 := &Column{
+		UniqueID: 12,
+	}
+	c.Assert(col1.HashCode(nil), DeepEquals, []byte{0x1, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xc})
+
+	col2 := &Column{
+		UniqueID: 2,
+	}
+	c.Assert(col2.HashCode(nil), DeepEquals, []byte{0x1, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2})
 }
 
 func (s *testEvaluatorSuite) TestColumn2Expr(c *C) {
@@ -100,12 +116,12 @@ func (s *testEvaluatorSuite) TestColumn2Expr(c *C) {
 
 	cols := make([]*Column, 0, 5)
 	for i := 0; i < 5; i++ {
-		cols = append(cols, &Column{FromID: fmt.Sprintf("DataSource_%d", i)})
+		cols = append(cols, &Column{UniqueID: int64(i)})
 	}
 
 	exprs := Column2Exprs(cols)
 	for i := range exprs {
-		c.Assert(exprs[i].Equal(cols[i], nil), IsTrue)
+		c.Assert(exprs[i].Equal(nil, cols[i]), IsTrue)
 	}
 }
 
@@ -116,7 +132,7 @@ func (s *testEvaluatorSuite) TestColInfo2Col(c *C) {
 	cols := []*Column{col0, col1}
 	colInfo := &model.ColumnInfo{Name: model.NewCIStr("col1")}
 	res := ColInfo2Col(cols, colInfo)
-	c.Assert(res.Equal(col1, nil), IsTrue)
+	c.Assert(res.Equal(nil, col1), IsTrue)
 
 	colInfo.Name = model.NewCIStr("col2")
 	res = ColInfo2Col(cols, colInfo)
@@ -126,25 +142,87 @@ func (s *testEvaluatorSuite) TestColInfo2Col(c *C) {
 func (s *testEvaluatorSuite) TestIndexInfo2Cols(c *C) {
 	defer testleak.AfterTest(c)()
 
-	col0, col1 := &Column{ColName: model.NewCIStr("col0")}, &Column{ColName: model.NewCIStr("col1")}
+	col0 := &Column{ColName: model.NewCIStr("col0"), RetType: types.NewFieldType(mysql.TypeLonglong)}
+	col1 := &Column{ColName: model.NewCIStr("col1"), RetType: types.NewFieldType(mysql.TypeLonglong)}
 	indexCol0, indexCol1 := &model.IndexColumn{Name: model.NewCIStr("col0")}, &model.IndexColumn{Name: model.NewCIStr("col1")}
 	indexInfo := &model.IndexInfo{Columns: []*model.IndexColumn{indexCol0, indexCol1}}
 
 	cols := []*Column{col0}
-	resCols, lengths := IndexInfo2Cols(cols, indexInfo)
+	resCols, lengths := IndexInfo2PrefixCols(cols, indexInfo)
 	c.Assert(len(resCols), Equals, 1)
 	c.Assert(len(lengths), Equals, 1)
-	c.Assert(resCols[0].Equal(col0, nil), IsTrue)
+	c.Assert(resCols[0].Equal(nil, col0), IsTrue)
 
 	cols = []*Column{col1}
-	resCols, lengths = IndexInfo2Cols(cols, indexInfo)
+	resCols, lengths = IndexInfo2PrefixCols(cols, indexInfo)
 	c.Assert(len(resCols), Equals, 0)
 	c.Assert(len(lengths), Equals, 0)
 
 	cols = []*Column{col0, col1}
-	resCols, lengths = IndexInfo2Cols(cols, indexInfo)
+	resCols, lengths = IndexInfo2PrefixCols(cols, indexInfo)
 	c.Assert(len(resCols), Equals, 2)
 	c.Assert(len(lengths), Equals, 2)
-	c.Assert(resCols[0].Equal(col0, nil), IsTrue)
-	c.Assert(resCols[1].Equal(col1, nil), IsTrue)
+	c.Assert(resCols[0].Equal(nil, col0), IsTrue)
+	c.Assert(resCols[1].Equal(nil, col1), IsTrue)
+}
+
+func (s *testEvaluatorSuite) TestColHybird(c *C) {
+	defer testleak.AfterTest(c)()
+	ctx := mock.NewContext()
+
+	// bit
+	ft := types.NewFieldType(mysql.TypeBit)
+	col := &Column{RetType: ft, Index: 0}
+	input := chunk.New([]*types.FieldType{ft}, 1024, 1024)
+	for i := 0; i < 1024; i++ {
+		num, err := types.ParseBitStr(fmt.Sprintf("0b%b", i))
+		c.Assert(err, IsNil)
+		input.AppendBytes(0, num)
+	}
+	result, err := newBuffer(types.ETInt, 1024)
+	c.Assert(err, IsNil)
+	c.Assert(col.VecEvalInt(ctx, input, result), IsNil)
+
+	it := chunk.NewIterator4Chunk(input)
+	for row, i := it.Begin(), 0; row != it.End(); row, i = it.Next(), i+1 {
+		v, _, err := col.EvalInt(ctx, row)
+		c.Assert(err, IsNil)
+		c.Assert(v, Equals, result.GetInt64(i))
+	}
+
+	// enum
+	ft = types.NewFieldType(mysql.TypeEnum)
+	col.RetType = ft
+	input = chunk.New([]*types.FieldType{ft}, 1024, 1024)
+	for i := 0; i < 1024; i++ {
+		input.AppendEnum(0, types.Enum{Name: fmt.Sprintf("%v", i), Value: uint64(i)})
+	}
+	result, err = newBuffer(types.ETString, 1024)
+	c.Assert(err, IsNil)
+	c.Assert(col.VecEvalString(ctx, input, result), IsNil)
+
+	it = chunk.NewIterator4Chunk(input)
+	for row, i := it.Begin(), 0; row != it.End(); row, i = it.Next(), i+1 {
+		v, _, err := col.EvalString(ctx, row)
+		c.Assert(err, IsNil)
+		c.Assert(v, Equals, result.GetString(i))
+	}
+
+	// set
+	ft = types.NewFieldType(mysql.TypeSet)
+	col.RetType = ft
+	input = chunk.New([]*types.FieldType{ft}, 1024, 1024)
+	for i := 0; i < 1024; i++ {
+		input.AppendSet(0, types.Set{Name: fmt.Sprintf("%v", i), Value: uint64(i)})
+	}
+	result, err = newBuffer(types.ETString, 1024)
+	c.Assert(err, IsNil)
+	c.Assert(col.VecEvalString(ctx, input, result), IsNil)
+
+	it = chunk.NewIterator4Chunk(input)
+	for row, i := it.Begin(), 0; row != it.End(); row, i = it.Next(), i+1 {
+		v, _, err := col.EvalString(ctx, row)
+		c.Assert(err, IsNil)
+		c.Assert(v, Equals, result.GetString(i))
+	}
 }

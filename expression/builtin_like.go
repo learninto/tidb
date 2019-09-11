@@ -16,10 +16,11 @@ package expression
 import (
 	"regexp"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/stringutil"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var (
@@ -29,6 +30,7 @@ var (
 
 var (
 	_ builtinFunc = &builtinLikeSig{}
+	_ builtinFunc = &builtinRegexpBinarySig{}
 	_ builtinFunc = &builtinRegexpSig{}
 )
 
@@ -36,51 +38,47 @@ type likeFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *likeFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
+func (c *likeFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
 	if err := c.verifyArgs(args); err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
-	argTp := []evalTp{tpString, tpString}
-	if len(args) == 3 {
-		argTp = append(argTp, tpInt)
-	}
-	bf, err := newBaseBuiltinFuncWithTp(args, ctx, tpInt, argTp...)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
+	argTp := []types.EvalType{types.ETString, types.ETString, types.ETInt}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, argTp...)
 	bf.tp.Flen = 1
-	sig := &builtinLikeSig{baseIntBuiltinFunc{bf}}
-	return sig.setSelf(sig), nil
+	sig := &builtinLikeSig{bf}
+	sig.setPbCode(tipb.ScalarFuncSig_LikeSig)
+	return sig, nil
 }
 
 type builtinLikeSig struct {
-	baseIntBuiltinFunc
+	baseBuiltinFunc
+}
+
+func (b *builtinLikeSig) Clone() builtinFunc {
+	newSig := &builtinLikeSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
 }
 
 // evalInt evals a builtinLikeSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/string-comparison-functions.html#operator_like
-func (b *builtinLikeSig) evalInt(row []types.Datum) (int64, bool, error) {
-	sc := b.ctx.GetSessionVars().StmtCtx
-	valStr, isNull, err := b.args[0].EvalString(row, sc)
+// NOTE: Currently tikv's like function is case sensitive, so we keep its behavior here.
+func (b *builtinLikeSig) evalInt(row chunk.Row) (int64, bool, error) {
+	valStr, isNull, err := b.args[0].EvalString(b.ctx, row)
 	if isNull || err != nil {
-		return 0, isNull, errors.Trace(err)
+		return 0, isNull, err
 	}
 
 	// TODO: We don't need to compile pattern if it has been compiled or it is static.
-	patternStr, isNull, err := b.args[1].EvalString(row, sc)
+	patternStr, isNull, err := b.args[1].EvalString(b.ctx, row)
 	if isNull || err != nil {
-		return 0, isNull, errors.Trace(err)
+		return 0, isNull, err
 	}
-	var escape byte = '\\'
-	// If this function is called by mock tikv, the args len will be 2 and the escape will be `\\`.
-	// TODO: Remove this after remove old evaluator logic.
-	if len(b.args) >= 3 {
-		val, isNull, err := b.args[2].EvalInt(row, sc)
-		if isNull || err != nil {
-			return 0, isNull, errors.Trace(err)
-		}
-		escape = byte(val)
+	val, isNull, err := b.args[2].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
+	escape := byte(val)
 	patChars, patTypes := stringutil.CompilePattern(patternStr, escape)
 	match := stringutil.DoMatch(valStr, patChars, patTypes)
 	return boolToInt64(match), false, nil
@@ -90,42 +88,77 @@ type regexpFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *regexpFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
+func (c *regexpFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
 	if err := c.verifyArgs(args); err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
-	sig := &builtinRegexpSig{newBaseBuiltinFunc(args, ctx)}
-	return sig.setSelf(sig), nil
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString, types.ETString)
+	bf.tp.Flen = 1
+	var sig builtinFunc
+	if types.IsBinaryStr(args[0].GetType()) || types.IsBinaryStr(args[1].GetType()) {
+		sig = &builtinRegexpBinarySig{bf}
+	} else {
+		sig = &builtinRegexpSig{bf}
+	}
+	return sig, nil
+}
+
+type builtinRegexpBinarySig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRegexpBinarySig) Clone() builtinFunc {
+	newSig := &builtinRegexpBinarySig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+func (b *builtinRegexpBinarySig) evalInt(row chunk.Row) (int64, bool, error) {
+	expr, isNull, err := b.args[0].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return 0, true, err
+	}
+
+	pat, isNull, err := b.args[1].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return 0, true, err
+	}
+
+	// TODO: We don't need to compile pattern if it has been compiled or it is static.
+	re, err := regexp.Compile(pat)
+	if err != nil {
+		return 0, true, ErrRegexp.GenWithStackByArgs(err.Error())
+	}
+	return boolToInt64(re.MatchString(expr)), false, nil
 }
 
 type builtinRegexpSig struct {
 	baseBuiltinFunc
 }
 
-// eval evals a builtinRegexpSig.
+func (b *builtinRegexpSig) Clone() builtinFunc {
+	newSig := &builtinRegexpSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals `expr REGEXP pat`, or `expr RLIKE pat`.
 // See https://dev.mysql.com/doc/refman/5.7/en/regexp.html#operator_regexp
-func (b *builtinRegexpSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	// TODO: We don't need to compile pattern if it has been compiled or it is static.
-	if args[0].IsNull() || args[1].IsNull() {
-		return
+func (b *builtinRegexpSig) evalInt(row chunk.Row) (int64, bool, error) {
+	expr, isNull, err := b.args[0].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return 0, true, err
 	}
 
-	targetStr, err := args[0].ToString()
-	if err != nil {
-		return d, errors.Errorf("non-string Expression in LIKE: %v (Value of type %T)", args[0], args[0])
+	pat, isNull, err := b.args[1].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return 0, true, err
 	}
-	patternStr, err := args[1].ToString()
+
+	// TODO: We don't need to compile pattern if it has been compiled or it is static.
+	re, err := regexp.Compile("(?i)" + pat)
 	if err != nil {
-		return d, errors.Errorf("non-string Expression in LIKE: %v (Value of type %T)", args[1], args[1])
+		return 0, true, ErrRegexp.GenWithStackByArgs(err.Error())
 	}
-	re, err := regexp.Compile(patternStr)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	d.SetInt64(boolToInt64(re.MatchString(targetStr)))
-	return
+	return boolToInt64(re.MatchString(expr)), false, nil
 }

@@ -19,6 +19,10 @@ import (
 )
 
 func TestString(t *testing.T) {
+	if String([]byte{}) != "" {
+		t.Fatal("Empty byte slice is not converted to empty string.")
+	}
+
 	b := []byte("hello world")
 	a := String(b)
 
@@ -39,11 +43,30 @@ func TestString(t *testing.T) {
 }
 
 func TestByte(t *testing.T) {
+	if !bytes.Equal(Slice(""), []byte{}) {
+		t.Fatal("Empty string is not converted to empty byte slice")
+	}
+
 	a := "hello world"
 
 	b := Slice(a)
 
 	if !bytes.Equal(b, []byte("hello world")) {
 		t.Fatal(string(b))
+	}
+}
+
+func TestMutable(t *testing.T) {
+	a := []byte{'a', 'b', 'c'}
+	b := String(a) // b is a mutable string.
+	c := string(b) // Warn, c is a mutable string
+	if c != "abc" {
+		t.Fatalf("assert fail")
+	}
+
+	// c changed after a is modified
+	a[0] = 's'
+	if c != "sbc" {
+		t.Fatal("test mutable string fail")
 	}
 }

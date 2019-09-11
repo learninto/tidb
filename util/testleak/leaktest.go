@@ -22,6 +22,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/pingcap/check"
@@ -40,8 +41,12 @@ func interestingGoroutines() (gs []string) {
 			strings.Contains(stack, "created by github.com/pingcap/tidb.init") ||
 			strings.Contains(stack, "testing.RunTests") ||
 			strings.Contains(stack, "check.(*resultTracker).start") ||
+			strings.Contains(stack, "check.(*suiteRunner).runFunc") ||
+			strings.Contains(stack, "check.(*suiteRunner).parallelRun") ||
 			strings.Contains(stack, "localstore.(*dbStore).scheduler") ||
+			strings.Contains(stack, "tikv.(*noGCHandler).Start") ||
 			strings.Contains(stack, "ddl.(*ddl).start") ||
+			strings.Contains(stack, "ddl.(*delRange).startEmulator") ||
 			strings.Contains(stack, "domain.NewDomain") ||
 			strings.Contains(stack, "testing.(*T).Run") ||
 			strings.Contains(stack, "domain.(*Domain).LoadPrivilegeLoop") ||
@@ -70,25 +75,23 @@ func BeforeTest() {
 	}
 }
 
-// AfterTest gets the current goroutines and runs the returned function to
-// get the goroutines at that time to contrast whether any goroutines leaked.
-// Usage: defer testleak.AfterTest(c)()
-// It can call with BeforeTest() at the beginning of check.Suite.TearDownSuite() or
-// call alone at the beginning of each test.
-func AfterTest(c *check.C) func() {
+const defaultCheckCnt = 50
+
+func checkLeakAfterTest(errorFunc func(cnt int, g string)) func() {
 	if len(beforeTestGorountines) == 0 {
 		for _, g := range interestingGoroutines() {
 			beforeTestGorountines[g] = true
 		}
 	}
 
+	cnt := defaultCheckCnt
 	return func() {
 		defer func() {
 			beforeTestGorountines = map[string]bool{}
 		}()
 
 		var leaked []string
-		for i := 0; i < 50; i++ {
+		for i := 0; i < cnt; i++ {
 			leaked = leaked[:0]
 			for _, g := range interestingGoroutines() {
 				if !beforeTestGorountines[g] {
@@ -105,7 +108,27 @@ func AfterTest(c *check.C) func() {
 			return
 		}
 		for _, g := range leaked {
-			c.Errorf("Test appears to have leaked: %v", g)
+			errorFunc(cnt, g)
 		}
 	}
+}
+
+// AfterTest gets the current goroutines and runs the returned function to
+// get the goroutines at that time to contrast whether any goroutines leaked.
+// Usage: defer testleak.AfterTest(c)()
+// It can call with BeforeTest() at the beginning of check.Suite.TearDownSuite() or
+// call alone at the beginning of each test.
+func AfterTest(c *check.C) func() {
+	errorFunc := func(cnt int, g string) {
+		c.Errorf("Test %s check-count %d appears to have leaked: %v", c.TestName(), cnt, g)
+	}
+	return checkLeakAfterTest(errorFunc)
+}
+
+// AfterTestT is used after all the test cases is finished.
+func AfterTestT(t *testing.T) func() {
+	errorFunc := func(cnt int, g string) {
+		t.Errorf("Test %s check-count %d appears to have leaked: %v", t.Name(), cnt, g)
+	}
+	return checkLeakAfterTest(errorFunc)
 }

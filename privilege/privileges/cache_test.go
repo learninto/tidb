@@ -15,10 +15,13 @@ package privileges_test
 
 import (
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/privilege/privileges"
+	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/store/mockstore"
 )
 
 var _ = Suite(&testCacheSuite{})
@@ -26,23 +29,26 @@ var _ = Suite(&testCacheSuite{})
 type testCacheSuite struct {
 	store  kv.Storage
 	dbName string
+	domain *domain.Domain
 }
 
 func (s *testCacheSuite) SetUpSuite(c *C) {
-	privileges.Enable = true
-	store, err := tidb.NewStore("memory://mysql")
+	store, err := mockstore.NewMockTikvStore()
+	session.SetSchemaLease(0)
+	session.DisableStats4Test()
 	c.Assert(err, IsNil)
-	_, err = tidb.BootstrapSession(store)
+	s.domain, err = session.BootstrapSession(store)
 	c.Assert(err, IsNil)
 	s.store = store
 }
 
-func (s *testCacheSuite) TearDown(c *C) {
+func (s *testCacheSuite) TearDownSuit(c *C) {
+	s.domain.Close()
 	s.store.Close()
 }
 
 func (s *testCacheSuite) TestLoadUserTable(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "use mysql;")
@@ -57,7 +63,7 @@ func (s *testCacheSuite) TestLoadUserTable(c *C) {
 	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Select_priv) VALUES ("%", "root", "", "Y")`)
 	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Insert_priv) VALUES ("%", "root1", "admin", "Y")`)
 	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Update_priv, Show_db_priv, References_priv) VALUES ("%", "root11", "", "Y", "Y", "Y")`)
-	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Create_user_priv, Index_priv, Execute_priv, Show_db_priv, Super_priv, Trigger_priv) VALUES ("%", "root111", "", "Y",  "Y", "Y", "Y", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Create_user_priv, Index_priv, Execute_priv, Create_view_priv, Show_view_priv, Show_db_priv, Super_priv, Trigger_priv) VALUES ("%", "root111", "", "Y",  "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
 
 	p = privileges.MySQLPrivilege{}
 	err = p.LoadUserTable(se)
@@ -67,28 +73,28 @@ func (s *testCacheSuite) TestLoadUserTable(c *C) {
 	c.Assert(user[0].Privileges, Equals, mysql.SelectPriv)
 	c.Assert(user[1].Privileges, Equals, mysql.InsertPriv)
 	c.Assert(user[2].Privileges, Equals, mysql.UpdatePriv|mysql.ShowDBPriv|mysql.ReferencesPriv)
-	c.Assert(user[3].Privileges, Equals, mysql.CreateUserPriv|mysql.IndexPriv|mysql.ExecutePriv|mysql.ShowDBPriv|mysql.SuperPriv|mysql.TriggerPriv)
+	c.Assert(user[3].Privileges, Equals, mysql.CreateUserPriv|mysql.IndexPriv|mysql.ExecutePriv|mysql.CreateViewPriv|mysql.ShowViewPriv|mysql.ShowDBPriv|mysql.SuperPriv|mysql.TriggerPriv)
 }
 
 func (s *testCacheSuite) TestLoadDBTable(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "use mysql;")
 	mustExec(c, se, "truncate table db;")
 
 	mustExec(c, se, `INSERT INTO mysql.db (Host, DB, User, Select_priv, Insert_priv, Update_priv, Delete_priv, Create_priv) VALUES ("%", "information_schema", "root", "Y", "Y", "Y", "Y", "Y")`)
-	mustExec(c, se, `INSERT INTO mysql.db (Host, DB, User, Drop_priv, Grant_priv, Index_priv, Alter_priv, Execute_priv) VALUES ("%", "mysql", "root1", "Y", "Y", "Y", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.db (Host, DB, User, Drop_priv, Grant_priv, Index_priv, Alter_priv, Create_view_priv, Show_view_priv, Execute_priv) VALUES ("%", "mysql", "root1", "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
 
 	var p privileges.MySQLPrivilege
 	err = p.LoadDBTable(se)
 	c.Assert(err, IsNil)
 	c.Assert(p.DB[0].Privileges, Equals, mysql.SelectPriv|mysql.InsertPriv|mysql.UpdatePriv|mysql.DeletePriv|mysql.CreatePriv)
-	c.Assert(p.DB[1].Privileges, Equals, mysql.DropPriv|mysql.GrantPriv|mysql.IndexPriv|mysql.AlterPriv|mysql.ExecutePriv)
+	c.Assert(p.DB[1].Privileges, Equals, mysql.DropPriv|mysql.GrantPriv|mysql.IndexPriv|mysql.AlterPriv|mysql.CreateViewPriv|mysql.ShowViewPriv|mysql.ExecutePriv)
 }
 
 func (s *testCacheSuite) TestLoadTablesPrivTable(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "use mysql;")
@@ -108,7 +114,7 @@ func (s *testCacheSuite) TestLoadTablesPrivTable(c *C) {
 }
 
 func (s *testCacheSuite) TestLoadColumnsPrivTable(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "use mysql;")
@@ -129,33 +135,63 @@ func (s *testCacheSuite) TestLoadColumnsPrivTable(c *C) {
 	c.Assert(p.ColumnsPriv[1].ColumnPriv, Equals, mysql.SelectPriv)
 }
 
+func (s *testCacheSuite) TestLoadDefaultRoleTable(c *C) {
+	se, err := session.CreateSession4Test(s.store)
+	c.Assert(err, IsNil)
+	defer se.Close()
+	mustExec(c, se, "use mysql;")
+	mustExec(c, se, "truncate table default_roles")
+
+	mustExec(c, se, `INSERT INTO mysql.default_roles VALUES ("%", "test_default_roles", "localhost", "r_1")`)
+	mustExec(c, se, `INSERT INTO mysql.default_roles VALUES ("%", "test_default_roles", "localhost", "r_2")`)
+	var p privileges.MySQLPrivilege
+	err = p.LoadDefaultRoles(se)
+	c.Assert(err, IsNil)
+	c.Assert(p.DefaultRoles[0].Host, Equals, `%`)
+	c.Assert(p.DefaultRoles[0].User, Equals, "test_default_roles")
+	c.Assert(p.DefaultRoles[0].DefaultRoleHost, Equals, "localhost")
+	c.Assert(p.DefaultRoles[0].DefaultRoleUser, Equals, "r_1")
+	c.Assert(p.DefaultRoles[1].DefaultRoleHost, Equals, "localhost")
+}
+
 func (s *testCacheSuite) TestPatternMatch(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
+	activeRoles := make([]*auth.RoleIdentity, 0)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "USE MYSQL;")
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, `INSERT INTO mysql.user VALUES ("10.0.%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user VALUES ("10.0.%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
 	var p privileges.MySQLPrivilege
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
-	c.Assert(p.RequestVerification("root", "10.0.1", "test", "", "", mysql.SelectPriv), IsTrue)
-	c.Assert(p.RequestVerification("root", "10.0.1.118", "test", "", "", mysql.SelectPriv), IsTrue)
-	c.Assert(p.RequestVerification("root", "localhost", "test", "", "", mysql.SelectPriv), IsFalse)
-	c.Assert(p.RequestVerification("root", "127.0.0.1", "test", "", "", mysql.SelectPriv), IsFalse)
-	c.Assert(p.RequestVerification("root", "114.114.114.114", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "10.0.1", "test", "", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "root", "10.0.1.118", "test", "", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "root", "localhost", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "127.0.0.1", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "114.114.114.114", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "114.114.114.114", "test", "", "", mysql.PrivilegeType(0)), IsTrue)
 
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, `INSERT INTO mysql.user VALUES ("", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user VALUES ("", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
 	p = privileges.MySQLPrivilege{}
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
-	c.Assert(p.RequestVerification("root", "", "test", "", "", mysql.SelectPriv), IsTrue)
-	c.Assert(p.RequestVerification("root", "notnull", "test", "", "", mysql.SelectPriv), IsFalse)
+	c.Assert(p.RequestVerification(activeRoles, "root", "", "test", "", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "root", "notnull", "test", "", "", mysql.SelectPriv), IsFalse)
+
+	// Pattern match for DB.
+	mustExec(c, se, "TRUNCATE TABLE mysql.user")
+	mustExec(c, se, "TRUNCATE TABLE mysql.db")
+	mustExec(c, se, `INSERT INTO mysql.db (user,host,db,select_priv) values ('genius', '%', 'te%', 'Y')`)
+	err = p.LoadDBTable(se)
+	c.Assert(err, IsNil)
+	c.Assert(p.RequestVerification(activeRoles, "genius", "127.0.0.1", "test", "", "", mysql.SelectPriv), IsTrue)
 }
 
 func (s *testCacheSuite) TestCaseInsensitive(c *C) {
-	se, err := tidb.CreateSession(s.store)
+	se, err := session.CreateSession4Test(s.store)
+	activeRoles := make([]*auth.RoleIdentity, 0)
 	c.Assert(err, IsNil)
 	defer se.Close()
 	mustExec(c, se, "CREATE DATABASE TCTrain;")
@@ -166,20 +202,87 @@ func (s *testCacheSuite) TestCaseInsensitive(c *C) {
 	err = p.LoadDBTable(se)
 	c.Assert(err, IsNil)
 	// DB and Table names are case insensitive in MySQL.
-	c.Assert(p.RequestVerification("genius", "127.0.0.1", "TCTrain", "TCTrainOrder", "", mysql.SelectPriv), IsTrue)
-	c.Assert(p.RequestVerification("genius", "127.0.0.1", "TCTRAIN", "TCTRAINORDER", "", mysql.SelectPriv), IsTrue)
-	c.Assert(p.RequestVerification("genius", "127.0.0.1", "tctrain", "tctrainorder", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "genius", "127.0.0.1", "TCTrain", "TCTrainOrder", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "genius", "127.0.0.1", "TCTRAIN", "TCTRAINORDER", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "genius", "127.0.0.1", "tctrain", "tctrainorder", "", mysql.SelectPriv), IsTrue)
+}
+
+func (s *testCacheSuite) TestLoadRoleGraph(c *C) {
+	se, err := session.CreateSession4Test(s.store)
+	c.Assert(err, IsNil)
+	defer se.Close()
+	mustExec(c, se, "use mysql;")
+	mustExec(c, se, "truncate table user;")
+
+	var p privileges.MySQLPrivilege
+	err = p.LoadRoleGraph(se)
+	c.Assert(err, IsNil)
+	c.Assert(len(p.User), Equals, 0)
+
+	mustExec(c, se, `INSERT INTO mysql.role_edges (FROM_HOST, FROM_USER, TO_HOST, TO_USER) VALUES ("%", "r_1", "%", "user2")`)
+	mustExec(c, se, `INSERT INTO mysql.role_edges (FROM_HOST, FROM_USER, TO_HOST, TO_USER) VALUES ("%", "r_2", "%", "root")`)
+	mustExec(c, se, `INSERT INTO mysql.role_edges (FROM_HOST, FROM_USER, TO_HOST, TO_USER) VALUES ("%", "r_3", "%", "user1")`)
+	mustExec(c, se, `INSERT INTO mysql.role_edges (FROM_HOST, FROM_USER, TO_HOST, TO_USER) VALUES ("%", "r_4", "%", "root")`)
+
+	p = privileges.MySQLPrivilege{}
+	err = p.LoadRoleGraph(se)
+	c.Assert(err, IsNil)
+	graph := p.RoleGraph
+	c.Assert(graph["root@%"].Find("r_2", "%"), Equals, true)
+	c.Assert(graph["root@%"].Find("r_4", "%"), Equals, true)
+	c.Assert(graph["user2@%"].Find("r_1", "%"), Equals, true)
+	c.Assert(graph["user1@%"].Find("r_3", "%"), Equals, true)
+	_, ok := graph["illedal"]
+	c.Assert(ok, Equals, false)
+	c.Assert(graph["root@%"].Find("r_1", "%"), Equals, false)
+}
+
+func (s *testCacheSuite) TestRoleGraphBFS(c *C) {
+	se, err := session.CreateSession4Test(s.store)
+	c.Assert(err, IsNil)
+	defer se.Close()
+	mustExec(c, se, `CREATE ROLE r_1, r_2, r_3, r_4, r_5, r_6;`)
+	mustExec(c, se, `GRANT r_2 TO r_1;`)
+	mustExec(c, se, `GRANT r_3 TO r_2;`)
+	mustExec(c, se, `GRANT r_4 TO r_3;`)
+	mustExec(c, se, `GRANT r_1 TO r_4;`)
+	mustExec(c, se, `GRANT r_5 TO r_3, r_6;`)
+
+	var p privileges.MySQLPrivilege
+	err = p.LoadRoleGraph(se)
+	c.Assert(err, IsNil)
+
+	activeRoles := make([]*auth.RoleIdentity, 0)
+	ret := p.FindAllRole(activeRoles)
+	c.Assert(len(ret), Equals, 0)
+	activeRoles = append(activeRoles, &auth.RoleIdentity{Username: "r_1", Hostname: "%"})
+	ret = p.FindAllRole(activeRoles)
+	c.Assert(len(ret), Equals, 5)
+
+	activeRoles = make([]*auth.RoleIdentity, 0)
+	activeRoles = append(activeRoles, &auth.RoleIdentity{Username: "r_6", Hostname: "%"})
+	ret = p.FindAllRole(activeRoles)
+	c.Assert(len(ret), Equals, 2)
+
+	activeRoles = make([]*auth.RoleIdentity, 0)
+	activeRoles = append(activeRoles, &auth.RoleIdentity{Username: "r_3", Hostname: "%"})
+	activeRoles = append(activeRoles, &auth.RoleIdentity{Username: "r_6", Hostname: "%"})
+	ret = p.FindAllRole(activeRoles)
+	c.Assert(len(ret), Equals, 6)
 }
 
 func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
-	privileges.Enable = true
-	store, err := tidb.NewStore("memory://sync_mysql_user")
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
-	domain, err := tidb.BootstrapSession(store)
-	c.Assert(err, IsNil)
-	defer domain.Close()
+	defer store.Close()
+	session.SetSchemaLease(0)
+	session.DisableStats4Test()
 
-	se, err := tidb.CreateSession(store)
+	dom, err := session.BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer dom.Close()
+
+	se, err := session.CreateSession4Test(store)
 	c.Assert(err, IsNil)
 	defer se.Close()
 
@@ -219,6 +322,9 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
   Event_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   Trigger_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   Create_tablespace_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
+  Create_role_priv ENUM('N','Y') NOT NULL DEFAULT 'N',
+  Drop_role_priv ENUM('N','Y') NOT NULL DEFAULT 'N',
+  Account_locked ENUM('N','Y') NOT NULL DEFAULT 'N',
   ssl_type enum('','ANY','X509','SPECIFIED') CHARACTER SET utf8 NOT NULL DEFAULT '',
   ssl_cipher blob NOT NULL,
   x509_issuer blob NOT NULL,
@@ -232,13 +338,14 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
   password_expired enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   PRIMARY KEY (Host,User)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='Users and global privileges';`)
-	mustExec(c, se, `INSERT INTO user VALUES ('localhost','root','','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','','','','',0,0,0,0,'mysql_native_password','','N');
+	mustExec(c, se, `INSERT INTO user VALUES ('localhost','root','','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','','','','',0,0,0,0,'mysql_native_password','','N');
 `)
 	var p privileges.MySQLPrivilege
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
+	activeRoles := make([]*auth.RoleIdentity, 0)
 	// MySQL mysql.user table schema is not identical to TiDB, check it doesn't break privilege.
-	c.Assert(p.RequestVerification("root", "localhost", "test", "", "", mysql.SelectPriv), IsTrue)
+	c.Assert(p.RequestVerification(activeRoles, "root", "localhost", "test", "", "", mysql.SelectPriv), IsTrue)
 
 	// Absent of those tables doesn't cause error.
 	mustExec(c, se, "DROP TABLE mysql.db;")
@@ -246,4 +353,52 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
 	mustExec(c, se, "DROP TABLE mysql.columns_priv;")
 	err = p.LoadAll(se)
 	c.Assert(err, IsNil)
+}
+
+func (s *testCacheSuite) TestSortUserTable(c *C) {
+	var p privileges.MySQLPrivilege
+	p.User = []privileges.UserRecord{
+		{Host: `%`, User: "root"},
+		{Host: `%`, User: "jeffrey"},
+		{Host: "localhost", User: "root"},
+		{Host: "localhost", User: ""},
+	}
+	p.SortUserTable()
+	result := []privileges.UserRecord{
+		{Host: "localhost", User: "root"},
+		{Host: "localhost", User: ""},
+		{Host: `%`, User: "jeffrey"},
+		{Host: `%`, User: "root"},
+	}
+	checkUserRecord(p.User, result, c)
+
+	p.User = []privileges.UserRecord{
+		{Host: `%`, User: "jeffrey"},
+		{Host: "h1.example.net", User: ""},
+	}
+	p.SortUserTable()
+	result = []privileges.UserRecord{
+		{Host: "h1.example.net", User: ""},
+		{Host: `%`, User: "jeffrey"},
+	}
+	checkUserRecord(p.User, result, c)
+
+	p.User = []privileges.UserRecord{
+		{Host: `192.168.%`, User: "xxx"},
+		{Host: `192.168.199.%`, User: "xxx"},
+	}
+	p.SortUserTable()
+	result = []privileges.UserRecord{
+		{Host: `192.168.199.%`, User: "xxx"},
+		{Host: `192.168.%`, User: "xxx"},
+	}
+	checkUserRecord(p.User, result, c)
+}
+
+func checkUserRecord(x, y []privileges.UserRecord, c *C) {
+	c.Assert(len(x), Equals, len(y))
+	for i := 0; i < len(x); i++ {
+		c.Assert(x[i].User, Equals, y[i].User)
+		c.Assert(x[i].Host, Equals, y[i].Host)
+	}
 }

@@ -14,15 +14,15 @@
 package ddl
 
 import (
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
 )
 
-func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+func onCreateForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	schemaID := job.SchemaID
-	tblInfo, err := getTableInfo(t, job, schemaID)
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
 	if err != nil {
 		return ver, errors.Trace(err)
 	}
@@ -30,7 +30,7 @@ func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ err
 	var fkInfo model.FKInfo
 	err = job.DecodeArgs(&fkInfo)
 	if err != nil {
-		job.State = model.JobCancelled
+		job.State = model.JobStateCancelled
 		return ver, errors.Trace(err)
 	}
 	fkInfo.ID = allocateIndexID(tblInfo)
@@ -41,24 +41,22 @@ func (d *ddl) onCreateForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ err
 	case model.StateNone:
 		// We just support record the foreign key, so we just make it public.
 		// none -> public
-		job.SchemaState = model.StatePublic
 		fkInfo.State = model.StatePublic
-		ver, err = updateTableInfo(t, job, tblInfo, originalState)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != fkInfo.State)
 		if err != nil {
 			return ver, errors.Trace(err)
 		}
 		// Finish this job.
-		job.State = model.JobDone
-		job.BinlogInfo.AddTableInfo(ver, tblInfo)
+		job.FinishTableJob(model.JobStateDone, model.StatePublic, ver, tblInfo)
 		return ver, nil
 	default:
-		return ver, ErrInvalidForeignKeyState.Gen("invalid fk state %v", fkInfo.State)
+		return ver, ErrInvalidForeignKeyState.GenWithStack("invalid fk state %v", fkInfo.State)
 	}
 }
 
-func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+func onDropForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	schemaID := job.SchemaID
-	tblInfo, err := getTableInfo(t, job, schemaID)
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
 	if err != nil {
 		return ver, errors.Trace(err)
 	}
@@ -70,7 +68,7 @@ func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error
 	)
 	err = job.DecodeArgs(&fkName)
 	if err != nil {
-		job.State = model.JobCancelled
+		job.State = model.JobStateCancelled
 		return ver, errors.Trace(err)
 	}
 
@@ -82,8 +80,8 @@ func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error
 	}
 
 	if !found {
-		job.State = model.JobCancelled
-		return ver, infoschema.ErrForeignKeyNotExists.GenByArgs(fkName)
+		job.State = model.JobStateCancelled
+		return ver, infoschema.ErrForeignKeyNotExists.GenWithStackByArgs(fkName)
 	}
 
 	nfks := tblInfo.ForeignKeys[:0]
@@ -99,18 +97,16 @@ func (d *ddl) onDropForeignKey(t *meta.Meta, job *model.Job) (ver int64, _ error
 	case model.StatePublic:
 		// We just support record the foreign key, so we just make it none.
 		// public -> none
-		job.SchemaState = model.StateNone
 		fkInfo.State = model.StateNone
-		ver, err = updateTableInfo(t, job, tblInfo, originalState)
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != fkInfo.State)
 		if err != nil {
 			return ver, errors.Trace(err)
 		}
 		// Finish this job.
-		job.State = model.JobDone
-		job.BinlogInfo.AddTableInfo(ver, tblInfo)
+		job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
 		return ver, nil
 	default:
-		return ver, ErrInvalidForeignKeyState.Gen("invalid fk state %v", fkInfo.State)
+		return ver, ErrInvalidForeignKeyState.GenWithStack("invalid fk state %v", fkInfo.State)
 	}
 
 }

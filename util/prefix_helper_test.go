@@ -14,13 +14,14 @@
 package util_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/testleak"
 )
@@ -43,22 +44,17 @@ type testPrefixSuite struct {
 }
 
 func (s *testPrefixSuite) SetUpSuite(c *C) {
-	path := "memory:"
-	d := localstore.Driver{
-		Driver: goleveldb.MemoryDriver{},
-	}
-	store, err := d.Open(path)
+	testleak.BeforeTest()
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	s.s = store
 
-	// must in cache
-	cacheS, _ := d.Open(path)
-	c.Assert(cacheS, Equals, store)
 }
 
 func (s *testPrefixSuite) TearDownSuite(c *C) {
 	err := s.s.Close()
 	c.Assert(err, IsNil)
+	testleak.AfterTest(c)()
 }
 
 func encodeInt(n int) []byte {
@@ -116,11 +112,10 @@ func (c *MockContext) CommitTxn() error {
 	if c.txn == nil {
 		return nil
 	}
-	return c.txn.Commit()
+	return c.txn.Commit(context.Background())
 }
 
 func (s *testPrefixSuite) TestPrefix(c *C) {
-	defer testleak.AfterTest(c)()
 	ctx := &MockContext{10000000, make(map[fmt.Stringer]interface{}), s.s, nil}
 	ctx.fillTxn()
 	txn, err := ctx.GetTxn(false)
@@ -133,19 +128,27 @@ func (s *testPrefixSuite) TestPrefix(c *C) {
 	txn, err = s.s.Begin()
 	c.Assert(err, IsNil)
 	k := []byte("key100jfowi878230")
-	err = txn.Set(k, []byte("val32dfaskli384757^*&%^"))
+	err = txn.Set(k, []byte(`val32dfaskli384757^*&%^`))
 	c.Assert(err, IsNil)
 	err = util.ScanMetaWithPrefix(txn, k, func(kv.Key, []byte) bool {
 		return true
 	})
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = util.ScanMetaWithPrefix(txn, k, func(kv.Key, []byte) bool {
+		return false
+	})
+	c.Assert(err, IsNil)
+	err = util.DelKeyWithPrefix(txn, []byte("key"))
+	c.Assert(err, IsNil)
+	_, err = txn.Get(context.TODO(), k)
+	c.Assert(terror.ErrorEqual(kv.ErrNotExist, err), IsTrue)
+
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 }
 
 func (s *testPrefixSuite) TestPrefixFilter(c *C) {
-	defer testleak.AfterTest(c)()
-	rowKey := []byte("test@#$%l(le[0]..prefix) 2uio")
+	rowKey := []byte(`test@#$%l(le[0]..prefix) 2uio`)
 	rowKey[8] = 0x00
 	rowKey[9] = 0x00
 	f := util.RowKeyPrefixFilter(rowKey)

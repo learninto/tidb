@@ -47,19 +47,19 @@ func (s *testStringUtilSuite) TestUnquote(c *C) {
 		{`"abcdef"`, `abcdef`, true},
 		{`"abc'def"`, `abc'def`, true},
 		{`"\a汉字测试"`, `a汉字测试`, true},
-		{`"☺"`, "☺", true},
-		{`"\xFF"`, "xFF", true},
-		{`"\U00010111"`, "U00010111", true},
-		{`"\U0001011111"`, "U0001011111", true},
+		{`"☺"`, `☺`, true},
+		{`"\xFF"`, `xFF`, true},
+		{`"\U00010111"`, `U00010111`, true},
+		{`"\U0001011111"`, `U0001011111`, true},
 		{`"\a\b\f\n\r\t\v\\\""`, "a\bf\n\r\tv\\\"", true},
-		{`"\Z\%\_"`, "\032\\%\\_", true},
+		{`"\Z\%\_"`, "\032" + `\%\_`, true},
 		{`"abc\0"`, "abc\000", true},
 		{`"abc\"abc"`, `abc"abc`, true},
 
 		{`'abcdef'`, `abcdef`, true},
 		{`'"'`, "\"", true},
 		{`'\a\b\f\n\r\t\v\\\''`, "a\bf\n\r\tv\\'", true},
-		{`' '`, " ", true},
+		{`' '`, ` `, true},
 		{"'\\a汉字'", "a汉字", true},
 		{"'\\a\x90'", "a\x90", true},
 		{`"\aèàø»"`, `aèàø»`, true},
@@ -85,34 +85,38 @@ func (s *testStringUtilSuite) TestPatternMatch(c *C) {
 		escape  byte
 		match   bool
 	}{
-		{"", "a", '\\', false},
-		{"a", "a", '\\', true},
-		{"a", "b", '\\', false},
-		{"aA", "aA", '\\', true},
-		{"_", "a", '\\', true},
-		{"_", "ab", '\\', false},
-		{"__", "b", '\\', false},
-		{"_ab", "AAB", '\\', true},
-		{"%", "abcd", '\\', true},
-		{"%", "", '\\', true},
-		{"%a", "AAA", '\\', true},
-		{"%b", "AAA", '\\', false},
-		{"b%", "BBB", '\\', true},
-		{"%a%", "BBB", '\\', false},
-		{"%a%", "BAB", '\\', true},
-		{"a%", "BBB", '\\', false},
+		{``, `a`, '\\', false},
+		{`a`, `a`, '\\', true},
+		{`a`, `b`, '\\', false},
+		{`aA`, `aA`, '\\', true},
+		{`_`, `a`, '\\', true},
+		{`_`, `ab`, '\\', false},
+		{`__`, `b`, '\\', false},
+		{`%`, `abcd`, '\\', true},
+		{`%`, ``, '\\', true},
+		{`%b`, `AAA`, '\\', false},
+		{`%a%`, `BBB`, '\\', false},
+		{`a%`, `BBB`, '\\', false},
 		{`\%a`, `%a`, '\\', true},
 		{`\%a`, `aa`, '\\', false},
 		{`\_a`, `_a`, '\\', true},
 		{`\_a`, `aa`, '\\', false},
 		{`\\_a`, `\xa`, '\\', true},
 		{`\a\b`, `\a\b`, '\\', true},
-		{"%%_", `abc`, '\\', true},
+		{`%%_`, `abc`, '\\', true},
+		{`%_%_aA`, "aaaA", '\\', true},
 		{`+_a`, `_a`, '+', true},
 		{`+%a`, `%a`, '+', true},
 		{`\%a`, `%a`, '+', false},
 		{`++a`, `+a`, '+', true},
 		{`++_a`, `+xa`, '+', true},
+		// We may reopen these test when like function go back to case insensitive.
+		/*
+			{"_ab", "AAB", '\\', true},
+			{"%a%", "BAB", '\\', true},
+			{"%a", "AAA", '\\', true},
+			{"b%", "BBB", '\\', true},
+		*/
 	}
 	for _, v := range tbl {
 		patChars, patTypes := CompilePattern(v.pattern, v.escape)
@@ -121,16 +125,30 @@ func (s *testStringUtilSuite) TestPatternMatch(c *C) {
 	}
 }
 
-func (s *testStringUtilSuite) TestRemoveBlanks(c *C) {
+func (s *testStringUtilSuite) TestIsExactMatch(c *C) {
 	defer testleak.AfterTest(c)()
-	tests := []struct {
-		input  string
-		output string
+	tbl := []struct {
+		pattern    string
+		escape     byte
+		exactMatch bool
 	}{
-		{"a\nb\rc d\te", "abcde"},
-		{"hello, 世界\npeace", "hello,世界peace"},
+		{``, '\\', true},
+		{`_`, '\\', false},
+		{`%`, '\\', false},
+		{`a`, '\\', true},
+		{`a_`, '\\', false},
+		{`a%`, '\\', false},
+		{`a\_`, '\\', true},
+		{`a\%`, '\\', true},
+		{`a\\`, '\\', true},
+		{`a\\_`, '\\', false},
+		{`a+%`, '+', true},
+		{`a\%`, '+', false},
+		{`a++`, '+', true},
+		{`a++_`, '+', false},
 	}
-	for _, tt := range tests {
-		c.Assert(RemoveBlanks(tt.input), Equals, tt.output)
+	for _, v := range tbl {
+		_, patTypes := CompilePattern(v.pattern, v.escape)
+		c.Assert(IsExactMatch(patTypes), Equals, v.exactMatch, Commentf("%v", v))
 	}
 }

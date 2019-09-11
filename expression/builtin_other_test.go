@@ -14,20 +14,28 @@
 package expression
 
 import (
-	"fmt"
 	"math"
-	"strings"
+	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/json"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/hack"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
-	"github.com/pingcap/tidb/util/types/json"
 )
 
 func (s *testEvaluatorSuite) TestBitCount(c *C) {
 	defer testleak.AfterTest(c)()
+	stmtCtx := s.ctx.GetSessionVars().StmtCtx
+	origin := stmtCtx.IgnoreTruncate
+	stmtCtx.IgnoreTruncate = true
+	defer func() {
+		stmtCtx.IgnoreTruncate = origin
+	}()
 	fc := funcs[ast.BitCount]
 	var bitCountCases = []struct {
 		origin interface{}
@@ -49,14 +57,16 @@ func (s *testEvaluatorSuite) TestBitCount(c *C) {
 	}
 	for _, test := range bitCountCases {
 		in := types.NewDatum(test.origin)
-		f, _ := fc.getFunction(datumsToConstants([]types.Datum{in}), s.ctx)
-		count, err := f.eval(nil)
+		f, err := fc.getFunction(s.ctx, s.datumsToConstants([]types.Datum{in}))
+		c.Assert(err, IsNil)
+		c.Assert(f, NotNil)
+		count, err := evalBuiltinFunc(f, chunk.Row{})
 		c.Assert(err, IsNil)
 		if count.IsNull() {
 			c.Assert(test.count, IsNil)
 			continue
 		}
-		sc := new(variable.StatementContext)
+		sc := new(stmtctx.StatementContext)
 		sc.IgnoreTruncate = true
 		res, err := count.ToInt64(sc)
 		c.Assert(err, IsNil)
@@ -64,30 +74,66 @@ func (s *testEvaluatorSuite) TestBitCount(c *C) {
 	}
 }
 
+func (s *testEvaluatorSuite) TestInFunc(c *C) {
+	defer testleak.AfterTest(c)()
+	fc := funcs[ast.In]
+	decimal1 := types.NewDecFromFloatForTest(123.121)
+	decimal2 := types.NewDecFromFloatForTest(123.122)
+	decimal3 := types.NewDecFromFloatForTest(123.123)
+	decimal4 := types.NewDecFromFloatForTest(123.124)
+	time1 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 1, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
+	time2 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 2, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
+	time3 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 3, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
+	time4 := types.Time{Time: types.FromGoTime(time.Date(2017, 1, 4, 1, 1, 1, 1, time.UTC)), Fsp: 6, Type: mysql.TypeDatetime}
+	duration1 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Minute + 1*time.Second)}
+	duration2 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Minute)}
+	duration3 := types.Duration{Duration: time.Duration(12*time.Hour + 1*time.Second)}
+	duration4 := types.Duration{Duration: time.Duration(12 * time.Hour)}
+	json1 := json.CreateBinary("123")
+	json2 := json.CreateBinary("123.1")
+	json3 := json.CreateBinary("123.2")
+	json4 := json.CreateBinary("123.3")
+	testCases := []struct {
+		args []interface{}
+		res  interface{}
+	}{
+		{[]interface{}{1, 1, 2, 3}, int64(1)},
+		{[]interface{}{1, 0, 2, 3}, int64(0)},
+		{[]interface{}{1, nil, 2, 3}, nil},
+		{[]interface{}{nil, nil, 2, 3}, nil},
+		{[]interface{}{uint64(0), 0, 2, 3}, int64(1)},
+		{[]interface{}{uint64(math.MaxUint64), uint64(math.MaxUint64), 2, 3}, int64(1)},
+		{[]interface{}{-1, uint64(math.MaxUint64), 2, 3}, int64(0)},
+		{[]interface{}{uint64(math.MaxUint64), -1, 2, 3}, int64(0)},
+		{[]interface{}{1, 0, 2, 3}, int64(0)},
+		{[]interface{}{1.1, 1.2, 1.3}, int64(0)},
+		{[]interface{}{1.1, 1.1, 1.2, 1.3}, int64(1)},
+		{[]interface{}{decimal1, decimal2, decimal3, decimal4}, int64(0)},
+		{[]interface{}{decimal1, decimal2, decimal3, decimal1}, int64(1)},
+		{[]interface{}{"1.1", "1.1", "1.2", "1.3"}, int64(1)},
+		{[]interface{}{"1.1", hack.Slice("1.1"), "1.2", "1.3"}, int64(1)},
+		{[]interface{}{hack.Slice("1.1"), "1.1", "1.2", "1.3"}, int64(1)},
+		{[]interface{}{time1, time2, time3, time1}, int64(1)},
+		{[]interface{}{time1, time2, time3, time4}, int64(0)},
+		{[]interface{}{duration1, duration2, duration3, duration4}, int64(0)},
+		{[]interface{}{duration1, duration2, duration1, duration4}, int64(1)},
+		{[]interface{}{json1, json2, json3, json4}, int64(0)},
+		{[]interface{}{json1, json1, json3, json4}, int64(1)},
+	}
+	for _, tc := range testCases {
+		fn, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
+		c.Assert(err, IsNil)
+		d, err := evalBuiltinFunc(fn, chunk.MutRowFromDatums(types.MakeDatums(tc.args...)).ToRow())
+		c.Assert(err, IsNil)
+		c.Assert(d.GetValue(), Equals, tc.res, Commentf("%v", types.MakeDatums(tc.args)))
+	}
+}
+
 func (s *testEvaluatorSuite) TestRowFunc(c *C) {
 	defer testleak.AfterTest(c)()
 	fc := funcs[ast.RowFunc]
-	testCases := []struct {
-		args []interface{}
-	}{
-		{[]interface{}{nil, nil}},
-		{[]interface{}{1, 2}},
-		{[]interface{}{"1", 2}},
-		{[]interface{}{"1", 2, true}},
-		{[]interface{}{"1", nil, true}},
-		{[]interface{}{"1", nil, true, nil}},
-		{[]interface{}{"1", 1.2, true, 120}},
-	}
-	for _, tc := range testCases {
-		fn, err := fc.getFunction(datumsToConstants(types.MakeDatums(tc.args...)), s.ctx)
-		c.Assert(err, IsNil)
-		d, err := fn.eval(types.MakeDatums(tc.args...))
-		c.Assert(err, IsNil)
-		c.Assert(d.Kind(), Equals, types.KindRow)
-		cmp, err := types.EqualDatums(nil, d.GetRow(), types.MakeDatums(tc.args...))
-		c.Assert(err, IsNil)
-		c.Assert(cmp, Equals, true)
-	}
+	_, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums([]interface{}{"1", 1.2, true, 120}...)))
+	c.Assert(err, IsNil)
 }
 
 func (s *testEvaluatorSuite) TestSetVar(c *C) {
@@ -104,10 +150,9 @@ func (s *testEvaluatorSuite) TestSetVar(c *C) {
 		{[]interface{}{"c", "dEf"}, "dEf"},
 	}
 	for _, tc := range testCases {
-		fn, err := fc.getFunction(datumsToConstants(types.MakeDatums(tc.args...)), s.ctx)
+		fn, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
-		c.Assert(fn.isDeterministic(), Equals, false)
-		d, err := fn.eval(types.MakeDatums(tc.args...))
+		d, err := evalBuiltinFunc(fn, chunk.MutRowFromDatums(types.MakeDatums(tc.args...)).ToRow())
 		c.Assert(err, IsNil)
 		c.Assert(d.GetString(), Equals, tc.res)
 		if tc.args[1] != nil {
@@ -115,7 +160,7 @@ func (s *testEvaluatorSuite) TestSetVar(c *C) {
 			c.Assert(ok, Equals, true)
 			val, ok := tc.res.(string)
 			c.Assert(ok, Equals, true)
-			c.Assert(s.ctx.GetSessionVars().Users[key], Equals, strings.ToLower(val))
+			c.Assert(s.ctx.GetSessionVars().Users[key], Equals, val)
 		}
 	}
 }
@@ -146,10 +191,9 @@ func (s *testEvaluatorSuite) TestGetVar(c *C) {
 		{[]interface{}{"d"}, ""},
 	}
 	for _, tc := range testCases {
-		fn, err := fc.getFunction(datumsToConstants(types.MakeDatums(tc.args...)), s.ctx)
+		fn, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(tc.args...)))
 		c.Assert(err, IsNil)
-		c.Assert(fn.isDeterministic(), Equals, false)
-		d, err := fn.eval(types.MakeDatums(tc.args...))
+		d, err := evalBuiltinFunc(fn, chunk.MutRowFromDatums(types.MakeDatums(tc.args...)).ToRow())
 		c.Assert(err, IsNil)
 		c.Assert(d.GetString(), Equals, tc.res)
 	}
@@ -157,44 +201,79 @@ func (s *testEvaluatorSuite) TestGetVar(c *C) {
 
 func (s *testEvaluatorSuite) TestValues(c *C) {
 	defer testleak.AfterTest(c)()
-	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, 1}
-	_, err := fc.getFunction(datumsToConstants(types.MakeDatums("")), s.ctx)
+
+	origin := s.ctx.GetSessionVars().StmtCtx.InInsertStmt
+	s.ctx.GetSessionVars().StmtCtx.InInsertStmt = false
+	defer func() {
+		s.ctx.GetSessionVars().StmtCtx.InInsertStmt = origin
+	}()
+
+	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, 1, types.NewFieldType(mysql.TypeVarchar)}
+	_, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums("")))
 	c.Assert(err, ErrorMatches, "*Incorrect parameter count in the call to native function 'values'")
-	sig, err := fc.getFunction(datumsToConstants(types.MakeDatums()), s.ctx)
+
+	sig, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums()))
 	c.Assert(err, IsNil)
-	c.Assert(sig.isDeterministic(), Equals, false)
-	_, err = sig.eval(nil)
-	c.Assert(err.Error(), Equals, "Session current insert values is nil")
-	s.ctx.GetSessionVars().CurrInsertValues = types.MakeDatums("1")
-	_, err = sig.eval(nil)
-	c.Assert(err.Error(), Equals, fmt.Sprintf("Session current insert values len %d and column's offset %v don't match", 1, 1))
+
+	ret, err := evalBuiltinFunc(sig, chunk.Row{})
+	c.Assert(err, IsNil)
+	c.Assert(ret.IsNull(), IsTrue)
+
+	s.ctx.GetSessionVars().CurrInsertValues = chunk.MutRowFromDatums(types.MakeDatums("1")).ToRow()
+	ret, err = evalBuiltinFunc(sig, chunk.Row{})
+	c.Assert(err, IsNil)
+	c.Assert(ret.IsNull(), IsTrue)
+
 	currInsertValues := types.MakeDatums("1", "2")
-	s.ctx.GetSessionVars().CurrInsertValues = currInsertValues
-	ret, err := sig.eval(nil)
+	s.ctx.GetSessionVars().StmtCtx.InInsertStmt = true
+	s.ctx.GetSessionVars().CurrInsertValues = chunk.MutRowFromDatums(currInsertValues).ToRow()
+	ret, err = evalBuiltinFunc(sig, chunk.Row{})
 	c.Assert(err, IsNil)
-	cmp, err := ret.CompareDatum(nil, currInsertValues[1])
+
+	cmp, err := ret.CompareDatum(nil, &currInsertValues[1])
 	c.Assert(err, IsNil)
 	c.Assert(cmp, Equals, 0)
 }
 
-func (s *testEvaluatorSuite) TestIn(c *C) {
+func (s *testEvaluatorSuite) TestSetVarFromColumn(c *C) {
 	defer testleak.AfterTest(c)()
-	fc := funcs[ast.In]
 
-	tbl := []struct {
-		Input    []interface{}
-		Expected interface{}
-	}{
-		{[]interface{}{nil, 1, "hello"}, nil},
-		{[]interface{}{json.CreateJSON(uint64(1)), -1, 2, 32768, 3.14}, int64(0)},
+	// Construct arguments.
+	argVarName := &Constant{
+		Value:   types.NewStringDatum("a"),
+		RetType: &types.FieldType{Tp: mysql.TypeVarString, Flen: 20},
 	}
-	for _, t := range tbl {
-		args := types.MakeDatums(t.Input...)
-		f, err := fc.getFunction(datumsToConstants(args), s.ctx)
-		c.Assert(err, IsNil)
+	argCol := &Column{
+		RetType: &types.FieldType{Tp: mysql.TypeVarString, Flen: 20},
+		Index:   0,
+	}
 
-		d, err := f.eval(nil)
-		c.Assert(err, IsNil)
-		c.Assert(d.GetValue(), Equals, t.Expected)
-	}
+	// Construct SetVar function.
+	funcSetVar, err := NewFunction(
+		s.ctx,
+		ast.SetVar,
+		&types.FieldType{Tp: mysql.TypeVarString, Flen: 20},
+		[]Expression{argVarName, argCol}...,
+	)
+	c.Assert(err, IsNil)
+
+	// Construct input and output Chunks.
+	inputChunk := chunk.NewChunkWithCapacity([]*types.FieldType{argCol.RetType}, 1)
+	inputChunk.AppendString(0, "a")
+	outputChunk := chunk.NewChunkWithCapacity([]*types.FieldType{argCol.RetType}, 1)
+
+	// Evaluate the SetVar function.
+	err = evalOneCell(s.ctx, funcSetVar, inputChunk.GetRow(0), outputChunk, 0)
+	c.Assert(err, IsNil)
+	c.Assert(outputChunk.GetRow(0).GetString(0), Equals, "a")
+
+	// Change the content of the underlying Chunk.
+	inputChunk.Reset()
+	inputChunk.AppendString(0, "b")
+
+	// Check whether the user variable changed.
+	sessionVars := s.ctx.GetSessionVars()
+	sessionVars.UsersLock.RLock()
+	defer sessionVars.UsersLock.RUnlock()
+	c.Assert(sessionVars.Users["a"], Equals, "a")
 }

@@ -77,7 +77,7 @@ func max(a, b int) int {
 func (ds *dataStore) get(e entry, key []byte) []byte {
 	slice := ds.slices[e.addr.sliceIdx]
 	valOffset := e.addr.offset + e.keyLen
-	if bytes.Compare(key, slice[e.addr.offset:valOffset]) != 0 {
+	if !bytes.Equal(key, slice[e.addr.offset:valOffset]) {
 		return nil
 	}
 	return slice[valOffset : valOffset+e.valLen]
@@ -150,9 +150,8 @@ func (m *MVMap) Put(key, value []byte) {
 	m.length++
 }
 
-// Get gets the values of the key.
-func (m *MVMap) Get(key []byte) [][]byte {
-	var values [][]byte
+// Get gets the values of the "key" and appends them to "values".
+func (m *MVMap) Get(key []byte, values [][]byte) [][]byte {
 	hashKey := fnvHash64(key)
 	entryAddr := m.hashTable[hashKey]
 	for entryAddr != nullEntryAddr {

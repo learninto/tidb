@@ -17,14 +17,13 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util"
 )
 
 var (
@@ -48,12 +47,30 @@ var (
 	ErrTableExists = terror.ClassSchema.New(codeTableExists, "Table '%s' already exists")
 	// ErrTableDropExists returns for dropping a non-existent table.
 	ErrTableDropExists = terror.ClassSchema.New(codeBadTable, "Unknown table '%s'")
+	// ErrUserDropExists returns for dropping a non-existent user.
+	ErrUserDropExists = terror.ClassSchema.New(codeBadUser, "User %s does not exist.")
 	// ErrColumnExists returns for column already exists.
 	ErrColumnExists = terror.ClassSchema.New(codeColumnExists, "Duplicate column name '%s'")
 	// ErrIndexExists returns for index already exists.
 	ErrIndexExists = terror.ClassSchema.New(codeIndexExists, "Duplicate Index")
+	// ErrKeyNameDuplicate returns for index duplicate when rename index.
+	ErrKeyNameDuplicate = terror.ClassSchema.New(codeKeyNameDuplicate, "Duplicate key name '%s'")
+	// ErrKeyNotExists returns for index not exists.
+	ErrKeyNotExists = terror.ClassSchema.New(codeKeyNotExists, "Key '%s' doesn't exist in table '%s'")
 	// ErrMultiplePriKey returns for multiple primary keys.
 	ErrMultiplePriKey = terror.ClassSchema.New(codeMultiplePriKey, "Multiple primary key defined")
+	// ErrTooManyKeyParts returns for too many key parts.
+	ErrTooManyKeyParts = terror.ClassSchema.New(codeTooManyKeyParts, "Too many key parts specified; max %d parts allowed")
+	// ErrTableNotLockedForWrite returns for write tables when only hold the table read lock.
+	ErrTableNotLockedForWrite = terror.ClassSchema.New(codeErrTableNotLockedForWrite, mysql.MySQLErrName[mysql.ErrTableNotLockedForWrite])
+	// ErrTableNotLocked returns when session has explicitly lock tables, then visit unlocked table will return this error.
+	ErrTableNotLocked = terror.ClassSchema.New(codeErrTableNotLocked, mysql.MySQLErrName[mysql.ErrTableNotLocked])
+	// ErrNonuniqTable returns when none unique tables errors.
+	ErrNonuniqTable = terror.ClassSchema.New(codeErrTableNotLocked, mysql.MySQLErrName[mysql.ErrNonuniqTable])
+	// ErrTableLocked returns when the table was locked by other session.
+	ErrTableLocked = terror.ClassSchema.New(codeTableLocked, mysql.MySQLErrName[mysql.ErrTableLocked])
+	// ErrAccessDenied return when the user doesn't have the permission to access the table.
+	ErrAccessDenied = terror.ClassSchema.New(codeErrAccessDenied, mysql.MySQLErrName[mysql.ErrAccessDenied])
 )
 
 // InfoSchema is the interface used to retrieve the schema information.
@@ -66,6 +83,7 @@ type InfoSchema interface {
 	TableByName(schema, table model.CIStr) (table.Table, error)
 	TableExists(schema, table model.CIStr) bool
 	SchemaByID(id int64) (*model.DBInfo, bool)
+	SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool)
 	TableByID(id int64) (table.Table, bool)
 	AllocByID(id int64) (autoid.Allocator, bool)
 	AllSchemaNames() []string
@@ -73,11 +91,14 @@ type InfoSchema interface {
 	Clone() (result []*model.DBInfo)
 	SchemaTables(schema model.CIStr) []table.Table
 	SchemaMetaVersion() int64
+	// TableIsView indicates whether the schema.table is a view.
+	TableIsView(schema, table model.CIStr) bool
 }
 
 // Information Schema Name.
 const (
-	Name = "INFORMATION_SCHEMA"
+	Name      = util.InformationSchemaName
+	LowerName = util.InformationSchemaLowerName
 )
 
 type sortedTables []table.Table
@@ -169,7 +190,16 @@ func (is *infoSchema) TableByName(schema, table model.CIStr) (t table.Table, err
 			return
 		}
 	}
-	return nil, ErrTableNotExists.GenByArgs(schema, table)
+	return nil, ErrTableNotExists.GenWithStackByArgs(schema, table)
+}
+
+func (is *infoSchema) TableIsView(schema, table model.CIStr) bool {
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if t, ok := tbNames.tables[table.L]; ok {
+			return t.Meta().IsView()
+		}
+	}
+	return false
 }
 
 func (is *infoSchema) TableExists(schema, table model.CIStr) bool {
@@ -190,6 +220,20 @@ func (is *infoSchema) SchemaByID(id int64) (val *model.DBInfo, ok bool) {
 	return nil, false
 }
 
+func (is *infoSchema) SchemaByTable(tableInfo *model.TableInfo) (val *model.DBInfo, ok bool) {
+	if tableInfo == nil {
+		return nil, false
+	}
+	for _, v := range is.schemaMap {
+		if tbl, ok := v.tables[tableInfo.Name.L]; ok {
+			if tbl.Meta().ID == tableInfo.ID {
+				return v.dbInfo, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
 	slice := is.sortedTablesBuckets[tableBucketIdx(id)]
 	idx := slice.searchTable(id)
@@ -204,7 +248,7 @@ func (is *infoSchema) AllocByID(id int64) (autoid.Allocator, bool) {
 	if !ok {
 		return nil, false
 	}
-	return tbl.Allocator(), true
+	return tbl.Allocator(nil), true
 }
 
 func (is *infoSchema) AllSchemaNames() (names []string) {
@@ -241,23 +285,16 @@ func (is *infoSchema) Clone() (result []*model.DBInfo) {
 
 // Handle handles information schema, including getting and setting.
 type Handle struct {
-	value      atomic.Value
-	store      kv.Storage
-	perfHandle perfschema.PerfSchema
+	value atomic.Value
+	store kv.Storage
 }
 
 // NewHandle creates a new Handle.
-func NewHandle(store kv.Storage) (*Handle, error) {
+func NewHandle(store kv.Storage) *Handle {
 	h := &Handle{
 		store: store,
 	}
-	// init memory tables
-	var err error
-	h.perfHandle, err = perfschema.NewPerfHandle()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return h, nil
+	return h
 }
 
 // Get gets information schema from Handle.
@@ -267,16 +304,15 @@ func (h *Handle) Get() InfoSchema {
 	return schema
 }
 
-// GetPerfHandle gets performance schema from handle.
-func (h *Handle) GetPerfHandle() perfschema.PerfSchema {
-	return h.perfHandle
+// IsValid uses to check whether handle value is valid.
+func (h *Handle) IsValid() bool {
+	return h.value.Load() != nil
 }
 
 // EmptyClone creates a new Handle with the same store and memSchema, but the value is not set.
 func (h *Handle) EmptyClone() *Handle {
 	newHandle := &Handle{
-		store:      h.store,
-		perfHandle: h.perfHandle,
+		store: h.store,
 	}
 	return newHandle
 }
@@ -292,29 +328,48 @@ const (
 	codeForeignKeyNotExists = 1091
 	codeWrongFkDef          = 1239
 
-	codeDatabaseExists = 1007
-	codeTableExists    = 1050
-	codeBadTable       = 1051
-	codeColumnExists   = 1060
-	codeIndexExists    = 1831
-	codeMultiplePriKey = 1068
+	codeDatabaseExists   = 1007
+	codeTableExists      = 1050
+	codeBadTable         = 1051
+	codeBadUser          = 3162
+	codeColumnExists     = 1060
+	codeIndexExists      = 1831
+	codeMultiplePriKey   = 1068
+	codeTooManyKeyParts  = 1070
+	codeKeyNameDuplicate = 1061
+	codeKeyNotExists     = 1176
+
+	codeErrTableNotLockedForWrite = mysql.ErrTableNotLockedForWrite
+	codeErrTableNotLocked         = mysql.ErrTableNotLocked
+	codeErrNonuniqTable           = mysql.ErrNonuniqTable
+	codeErrAccessDenied           = mysql.ErrAccessDenied
+	codeTableLocked               = mysql.ErrTableLocked
 )
 
 func init() {
 	schemaMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeDBDropExists:        mysql.ErrDBDropExists,
-		codeDatabaseNotExists:   mysql.ErrBadDB,
-		codeTableNotExists:      mysql.ErrNoSuchTable,
-		codeColumnNotExists:     mysql.ErrBadField,
-		codeCannotAddForeign:    mysql.ErrCannotAddForeign,
-		codeWrongFkDef:          mysql.ErrWrongFkDef,
-		codeForeignKeyNotExists: mysql.ErrCantDropFieldOrKey,
-		codeDatabaseExists:      mysql.ErrDBCreateExists,
-		codeTableExists:         mysql.ErrTableExists,
-		codeBadTable:            mysql.ErrBadTable,
-		codeColumnExists:        mysql.ErrDupFieldName,
-		codeIndexExists:         mysql.ErrDupIndex,
-		codeMultiplePriKey:      mysql.ErrMultiplePriKey,
+		codeDBDropExists:              mysql.ErrDBDropExists,
+		codeDatabaseNotExists:         mysql.ErrBadDB,
+		codeTableNotExists:            mysql.ErrNoSuchTable,
+		codeColumnNotExists:           mysql.ErrBadField,
+		codeCannotAddForeign:          mysql.ErrCannotAddForeign,
+		codeWrongFkDef:                mysql.ErrWrongFkDef,
+		codeForeignKeyNotExists:       mysql.ErrCantDropFieldOrKey,
+		codeDatabaseExists:            mysql.ErrDBCreateExists,
+		codeTableExists:               mysql.ErrTableExists,
+		codeBadTable:                  mysql.ErrBadTable,
+		codeBadUser:                   mysql.ErrBadUser,
+		codeColumnExists:              mysql.ErrDupFieldName,
+		codeIndexExists:               mysql.ErrDupIndex,
+		codeMultiplePriKey:            mysql.ErrMultiplePriKey,
+		codeTooManyKeyParts:           mysql.ErrTooManyKeyParts,
+		codeKeyNameDuplicate:          mysql.ErrDupKeyName,
+		codeKeyNotExists:              mysql.ErrKeyDoesNotExist,
+		codeErrTableNotLockedForWrite: mysql.ErrTableNotLockedForWrite,
+		codeErrTableNotLocked:         mysql.ErrTableNotLocked,
+		codeErrNonuniqTable:           mysql.ErrNonuniqTable,
+		mysql.ErrAccessDenied:         mysql.ErrAccessDenied,
+		codeTableLocked:               mysql.ErrTableLocked,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
 	initInfoSchemaDB()
@@ -346,5 +401,23 @@ func initInfoSchemaDB() {
 
 // IsMemoryDB checks if the db is in memory.
 func IsMemoryDB(dbName string) bool {
-	return dbName == "information_schema" || dbName == "performance_schema"
+	if dbName == "information_schema" {
+		return true
+	}
+	for _, driver := range drivers {
+		if driver.DBInfo.Name.L == dbName {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAutoIncrementColumn checks whether the table has auto_increment columns, if so, return true and the column name.
+func HasAutoIncrementColumn(tbInfo *model.TableInfo) (bool, string) {
+	for _, col := range tbInfo.Columns {
+		if mysql.HasAutoIncrementFlag(col.Flag) {
+			return true, col.Name.L
+		}
+	}
+	return false, ""
 }

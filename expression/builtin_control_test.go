@@ -18,10 +18,11 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func (s *testEvaluatorSuite) TestCaseWhen(c *C) {
@@ -37,18 +38,20 @@ func (s *testEvaluatorSuite) TestCaseWhen(c *C) {
 		{[]interface{}{nil, 1, nil, 2, 3}, 3},
 		{[]interface{}{false, 1, nil, 2, 3}, 3},
 		{[]interface{}{nil, 1, false, 2, 3}, 3},
+		{[]interface{}{1, jsonInt.GetMysqlJSON(), nil}, 3},
+		{[]interface{}{0, jsonInt.GetMysqlJSON(), nil}, nil},
 	}
 	fc := funcs[ast.Case]
 	for _, t := range tbl {
-		f, err := fc.getFunction(datumsToConstants(types.MakeDatums(t.Arg...)), s.ctx)
+		f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(t.Arg...)))
 		c.Assert(err, IsNil)
-		d, err := f.eval(nil)
+		d, err := evalBuiltinFunc(f, chunk.Row{})
 		c.Assert(err, IsNil)
 		c.Assert(d, testutil.DatumEquals, types.NewDatum(t.Ret))
 	}
-	f, err := fc.getFunction(datumsToConstants(types.MakeDatums(errors.New("can't convert string to bool"), 1, true)), s.ctx)
+	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(errors.New("can't convert string to bool"), 1, true)))
 	c.Assert(err, IsNil)
-	_, err = f.eval(nil)
+	_, err = evalBuiltinFunc(f, chunk.Row{})
 	c.Assert(err, NotNil)
 }
 
@@ -75,22 +78,22 @@ func (s *testEvaluatorSuite) TestIf(c *C) {
 		{duration, 1, 2, 1},
 		{types.Duration{Duration: time.Duration(0)}, 1, 2, 2},
 		{types.NewDecFromStringForTest("1.2"), 1, 2, 1},
+		{jsonInt.GetMysqlJSON(), 1, 2, 1},
 	}
 
 	fc := funcs[ast.If]
 	for _, t := range tbl {
-		f, err := fc.getFunction(datumsToConstants(types.MakeDatums(t.Arg1, t.Arg2, t.Arg3)), s.ctx)
+		f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(t.Arg1, t.Arg2, t.Arg3)))
 		c.Assert(err, IsNil)
-		c.Assert(f.isDeterministic(), IsTrue)
-		d, err := f.eval(nil)
+		d, err := evalBuiltinFunc(f, chunk.Row{})
 		c.Assert(err, IsNil)
 		c.Assert(d, testutil.DatumEquals, types.NewDatum(t.Ret))
 	}
-	f, err := fc.getFunction(datumsToConstants(types.MakeDatums(errors.New("must error"), 1, 2)), s.ctx)
+	f, err := fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(errors.New("must error"), 1, 2)))
 	c.Assert(err, IsNil)
-	_, err = f.eval(nil)
+	_, err = evalBuiltinFunc(f, chunk.Row{})
 	c.Assert(err, NotNil)
-	_, err = fc.getFunction(datumsToConstants(types.MakeDatums(1, 2)), s.ctx)
+	_, err = fc.getFunction(s.ctx, s.datumsToConstants(types.MakeDatums(1, 2)))
 	c.Assert(err, NotNil)
 }
 
@@ -109,16 +112,17 @@ func (s *testEvaluatorSuite) TestIfNull(c *C) {
 		{tm, nil, tm, false, false},
 		{nil, duration, duration, false, false},
 		{nil, types.NewDecFromFloatForTest(123.123), types.NewDecFromFloatForTest(123.123), false, false},
-		{nil, types.Bit{Value: 1, Width: 8}, "\x01", false, false},
-		{nil, types.Hex{Value: 1}, "\x01", false, false},
+		{nil, types.NewBinaryLiteralFromUint(0x01, -1), uint64(1), false, false},
 		{nil, types.Set{Value: 1, Name: "abc"}, "abc", false, false},
+		{nil, jsonInt.GetMysqlJSON(), jsonInt.GetMysqlJSON(), false, false},
 		{"abc", nil, "abc", false, false},
+		{errors.New(""), nil, "", true, true},
 	}
 
 	for _, t := range tbl {
-		f, err := newFunctionForTest(s.ctx, ast.Ifnull, primitiveValsToConstants([]interface{}{t.arg1, t.arg2})...)
+		f, err := newFunctionForTest(s.ctx, ast.Ifnull, s.primitiveValsToConstants([]interface{}{t.arg1, t.arg2})...)
 		c.Assert(err, IsNil)
-		d, err := f.Eval(nil)
+		d, err := f.Eval(chunk.Row{})
 		if t.getErr {
 			c.Assert(err, NotNil)
 		} else {
@@ -131,33 +135,9 @@ func (s *testEvaluatorSuite) TestIfNull(c *C) {
 		}
 	}
 
-	f, err := funcs[ast.Ifnull].getFunction([]Expression{Zero, Zero}, s.ctx)
+	_, err := funcs[ast.Ifnull].getFunction(s.ctx, []Expression{Zero, Zero})
 	c.Assert(err, IsNil)
-	c.Assert(f.isDeterministic(), IsTrue)
 
-	f, err = funcs[ast.Ifnull].getFunction([]Expression{Zero}, s.ctx)
+	_, err = funcs[ast.Ifnull].getFunction(s.ctx, []Expression{Zero})
 	c.Assert(err, NotNil)
-}
-
-func (s *testEvaluatorSuite) TestNullIf(c *C) {
-	defer testleak.AfterTest(c)()
-	tbl := []struct {
-		Arg1 interface{}
-		Arg2 interface{}
-		Ret  interface{}
-	}{
-		{1, 1, nil},
-		{nil, 2, nil},
-		{1, nil, 1},
-		{1, 2, 1},
-	}
-
-	for _, t := range tbl {
-		fc := funcs[ast.Nullif]
-		f, err := fc.getFunction(datumsToConstants(types.MakeDatums(t.Arg1, t.Arg2)), s.ctx)
-		c.Assert(err, IsNil)
-		d, err := f.eval(nil)
-		c.Assert(err, IsNil)
-		c.Assert(d, testutil.DatumEquals, types.NewDatum(t.Ret))
-	}
 }

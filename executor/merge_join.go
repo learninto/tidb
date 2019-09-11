@@ -14,12 +14,15 @@
 package executor
 
 import (
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/context"
+	"context"
+	"fmt"
+
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/memory"
+	"github.com/pingcap/tidb/util/stringutil"
 )
 
 // MergeJoinExec implements the merge join algorithm.
@@ -30,467 +33,231 @@ import (
 // 2. For other cases its preferred not to use SMJ and operator
 // will throw error.
 type MergeJoinExec struct {
-	// Left is always the driver side
+	baseExecutor
 
-	ctx           context.Context
-	stmtCtx       *variable.StatementContext
-	leftJoinKeys  []*expression.Column
-	rightJoinKeys []*expression.Column
-	prepared      bool
-	leftFilter    []expression.Expression
-	otherFilter   []expression.Expression
-	schema        *expression.Schema
-	preserveLeft  bool // To preserve left side of the relation as in left outer join
-	cursor        int
-	defaultValues []types.Datum
+	stmtCtx      *stmtctx.StatementContext
+	compareFuncs []expression.CompareFunc
+	joiner       joiner
+	isOuterJoin  bool
 
-	// Default for both side in case full join
+	prepared bool
+	outerIdx int
 
-	defaultRightRow Row
-	outputBuf       []Row
-	leftRowBlock    *rowBlockIterator
-	rightRowBlock   *rowBlockIterator
-	leftRows        []Row
-	rightRows       []Row
-	desc            bool
-	flipSide        bool
+	innerTable *mergeJoinInnerTable
+	outerTable *mergeJoinOuterTable
+
+	innerRows     []chunk.Row
+	innerIter4Row chunk.Iterator
+
+	childrenResults []*chunk.Chunk
+
+	memTracker *memory.Tracker
 }
 
-const rowBufferSize = 4096
+type mergeJoinOuterTable struct {
+	reader Executor
+	filter []expression.Expression
+	keys   []*expression.Column
 
-type joinBuilder struct {
-	context       context.Context
-	leftChild     Executor
-	rightChild    Executor
-	eqConditions  []*expression.ScalarFunction
-	leftFilter    []expression.Expression
-	rightFilter   []expression.Expression
-	otherFilter   []expression.Expression
-	schema        *expression.Schema
-	joinType      plan.JoinType
-	defaultValues []types.Datum
+	chk      *chunk.Chunk
+	selected []bool
+
+	iter     *chunk.Iterator4Chunk
+	row      chunk.Row
+	hasMatch bool
+	hasNull  bool
 }
 
-func (b *joinBuilder) Context(context context.Context) *joinBuilder {
-	b.context = context
-	return b
+// mergeJoinInnerTable represents the inner table of merge join.
+// All the inner rows which have the same join key are returned when function
+// "rowsWithSameKey()" being called.
+type mergeJoinInnerTable struct {
+	reader   Executor
+	joinKeys []*expression.Column
+	ctx      context.Context
+
+	// for chunk executions
+	sameKeyRows    []chunk.Row
+	keyCmpFuncs    []chunk.CompareFunc
+	firstRow4Key   chunk.Row
+	curRow         chunk.Row
+	curResult      *chunk.Chunk
+	curIter        *chunk.Iterator4Chunk
+	curResultInUse bool
+	resultQueue    []*chunk.Chunk
+	resourceQueue  []*chunk.Chunk
+
+	memTracker *memory.Tracker
 }
 
-func (b *joinBuilder) EqualConditions(conds []*expression.ScalarFunction) *joinBuilder {
-	b.eqConditions = conds
-	return b
-}
-
-func (b *joinBuilder) LeftChild(exec Executor) *joinBuilder {
-	b.leftChild = exec
-	return b
-}
-
-func (b *joinBuilder) RightChild(exec Executor) *joinBuilder {
-	b.rightChild = exec
-	return b
-}
-
-func (b *joinBuilder) LeftFilter(expr []expression.Expression) *joinBuilder {
-	b.leftFilter = expr
-	return b
-}
-
-func (b *joinBuilder) RightFilter(expr []expression.Expression) *joinBuilder {
-	b.rightFilter = expr
-	return b
-}
-
-func (b *joinBuilder) OtherFilter(expr []expression.Expression) *joinBuilder {
-	b.otherFilter = expr
-	return b
-}
-
-func (b *joinBuilder) Schema(schema *expression.Schema) *joinBuilder {
-	b.schema = schema
-	return b
-}
-
-func (b *joinBuilder) JoinType(joinType plan.JoinType) *joinBuilder {
-	b.joinType = joinType
-	return b
-}
-
-func (b *joinBuilder) DefaultVals(defaultValues []types.Datum) *joinBuilder {
-	b.defaultValues = defaultValues
-	return b
-}
-
-func (b *joinBuilder) BuildMergeJoin(assumeSortedDesc bool) (*MergeJoinExec, error) {
-	var leftJoinKeys, rightJoinKeys []*expression.Column
-	for _, eqCond := range b.eqConditions {
-		if len(eqCond.GetArgs()) != 2 {
-			return nil, errors.Annotate(ErrBuildExecutor, "invalid join key for equal condition")
-		}
-		lKey, ok := eqCond.GetArgs()[0].(*expression.Column)
-		if !ok {
-			return nil, errors.Annotate(ErrBuildExecutor, "left side of join key must be column for merge join")
-		}
-		rKey, ok := eqCond.GetArgs()[1].(*expression.Column)
-		if !ok {
-			return nil, errors.Annotate(ErrBuildExecutor, "right side of join key must be column for merge join")
-		}
-		leftJoinKeys = append(leftJoinKeys, lKey)
-		rightJoinKeys = append(rightJoinKeys, rKey)
-	}
-	leftRowBlock := &rowBlockIterator{
-		ctx:      b.context,
-		reader:   b.leftChild,
-		filter:   b.leftFilter,
-		joinKeys: leftJoinKeys,
-	}
-
-	rightRowBlock := &rowBlockIterator{
-		ctx:      b.context,
-		reader:   b.rightChild,
-		filter:   b.rightFilter,
-		joinKeys: rightJoinKeys,
-	}
-
-	exec := &MergeJoinExec{
-		ctx:           b.context,
-		leftJoinKeys:  leftJoinKeys,
-		rightJoinKeys: rightJoinKeys,
-		leftRowBlock:  leftRowBlock,
-		rightRowBlock: rightRowBlock,
-		otherFilter:   b.otherFilter,
-		schema:        b.schema,
-		desc:          assumeSortedDesc,
-	}
-
-	switch b.joinType {
-	case plan.LeftOuterJoin:
-		exec.leftRowBlock.filter = nil
-		exec.leftFilter = b.leftFilter
-		exec.preserveLeft = true
-		exec.defaultRightRow = b.defaultValues
-	case plan.RightOuterJoin:
-		exec.leftRowBlock = rightRowBlock
-		exec.rightRowBlock = leftRowBlock
-		exec.leftRowBlock.filter = nil
-		exec.leftFilter = b.leftFilter
-		exec.preserveLeft = true
-		exec.defaultRightRow = b.defaultValues
-		exec.flipSide = true
-		exec.leftJoinKeys = rightJoinKeys
-		exec.rightJoinKeys = leftJoinKeys
-	case plan.InnerJoin:
-	default:
-		return nil, errors.Annotate(ErrBuildExecutor, "unknown join type")
-	}
-	return exec, nil
-}
-
-// rowBlockIterator represents a row block with the same join keys
-type rowBlockIterator struct {
-	stmtCtx   *variable.StatementContext
-	ctx       context.Context
-	reader    Executor
-	filter    []expression.Expression
-	joinKeys  []*expression.Column
-	peekedRow Row
-	rowCache  []Row
-}
-
-func (rb *rowBlockIterator) init() error {
-	if rb.reader == nil || rb.joinKeys == nil || len(rb.joinKeys) == 0 || rb.ctx == nil {
+func (t *mergeJoinInnerTable) init(ctx context.Context, chk4Reader *chunk.Chunk) (err error) {
+	if t.reader == nil || ctx == nil {
 		return errors.Errorf("Invalid arguments: Empty arguments detected.")
 	}
-	rb.stmtCtx = rb.ctx.GetSessionVars().StmtCtx
-	var err error
-	rb.peekedRow, err = rb.nextRow()
-	if err != nil {
-		return errors.Trace(err)
+	t.ctx = ctx
+	t.curResult = chk4Reader
+	t.curIter = chunk.NewIterator4Chunk(t.curResult)
+	t.curRow = t.curIter.End()
+	t.curResultInUse = false
+	t.resultQueue = append(t.resultQueue, chk4Reader)
+	t.memTracker.Consume(chk4Reader.MemoryUsage())
+	t.firstRow4Key, err = t.nextRow()
+	t.keyCmpFuncs = make([]chunk.CompareFunc, 0, len(t.joinKeys))
+	for i := range t.joinKeys {
+		t.keyCmpFuncs = append(t.keyCmpFuncs, chunk.GetCompareFunc(t.joinKeys[i].RetType))
 	}
-	rb.rowCache = make([]Row, 0, rowBufferSize)
-
-	return nil
+	return err
 }
 
-func (rb *rowBlockIterator) nextRow() (Row, error) {
-	for {
-		row, err := rb.reader.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			return nil, nil
-		}
-		if rb.filter != nil {
-			matched, err := expression.EvalBool(rb.filter, row, rb.ctx)
-			if err != nil {
-				return nil, errors.Trace(err)
-			}
-			if !matched {
-				continue
-			}
-		}
-		return row, nil
-	}
-}
-
-func (rb *rowBlockIterator) nextBlock() ([]Row, error) {
-	var err error
-	peekedRow := rb.peekedRow
-	var curRow Row
-	if peekedRow == nil {
+func (t *mergeJoinInnerTable) rowsWithSameKey() ([]chunk.Row, error) {
+	lastResultIdx := len(t.resultQueue) - 1
+	t.resourceQueue = append(t.resourceQueue, t.resultQueue[0:lastResultIdx]...)
+	t.resultQueue = t.resultQueue[lastResultIdx:]
+	// no more data.
+	if t.firstRow4Key == t.curIter.End() {
 		return nil, nil
 	}
-	rowCache := rb.rowCache[0:0:rowBufferSize]
-	rowCache = append(rowCache, peekedRow)
+	t.sameKeyRows = t.sameKeyRows[:0]
+	t.sameKeyRows = append(t.sameKeyRows, t.firstRow4Key)
 	for {
-		curRow, err = rb.nextRow()
-		if err != nil {
-			return nil, errors.Trace(err)
+		selectedRow, err := t.nextRow()
+		// error happens or no more data.
+		if err != nil || selectedRow == t.curIter.End() {
+			t.firstRow4Key = t.curIter.End()
+			return t.sameKeyRows, err
 		}
-		if curRow == nil {
-			rb.peekedRow = nil
-			return rowCache, nil
-		}
-		compareResult, err := compareKeys(rb.stmtCtx, curRow, rb.joinKeys, rb.peekedRow, rb.joinKeys)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
+		compareResult := compareChunkRow(t.keyCmpFuncs, selectedRow, t.firstRow4Key, t.joinKeys, t.joinKeys)
 		if compareResult == 0 {
-			rowCache = append(rowCache, curRow)
+			t.sameKeyRows = append(t.sameKeyRows, selectedRow)
 		} else {
-			rb.peekedRow = curRow
-			return rowCache, nil
+			t.firstRow4Key = selectedRow
+			return t.sameKeyRows, nil
 		}
 	}
+}
+
+func (t *mergeJoinInnerTable) nextRow() (chunk.Row, error) {
+	for {
+		if t.curRow == t.curIter.End() {
+			t.reallocReaderResult()
+			oldMemUsage := t.curResult.MemoryUsage()
+			err := Next(t.ctx, t.reader, t.curResult)
+			// error happens or no more data.
+			if err != nil || t.curResult.NumRows() == 0 {
+				t.curRow = t.curIter.End()
+				return t.curRow, err
+			}
+			newMemUsage := t.curResult.MemoryUsage()
+			t.memTracker.Consume(newMemUsage - oldMemUsage)
+			t.curRow = t.curIter.Begin()
+		}
+
+		result := t.curRow
+		t.curResultInUse = true
+		t.curRow = t.curIter.Next()
+
+		if !t.hasNullInJoinKey(result) {
+			return result, nil
+		}
+	}
+}
+
+func (t *mergeJoinInnerTable) hasNullInJoinKey(row chunk.Row) bool {
+	for _, col := range t.joinKeys {
+		ordinal := col.Index
+		if row.IsNull(ordinal) {
+			return true
+		}
+	}
+	return false
+}
+
+// reallocReaderResult resets "t.curResult" to an empty Chunk to buffer the result of "t.reader".
+// It pops a Chunk from "t.resourceQueue" and push it into "t.resultQueue" immediately.
+func (t *mergeJoinInnerTable) reallocReaderResult() {
+	if !t.curResultInUse {
+		// If "t.curResult" is not in use, we can just reuse it.
+		t.curResult.Reset()
+		return
+	}
+
+	// Create a new Chunk and append it to "resourceQueue" if there is no more
+	// available chunk in "resourceQueue".
+	if len(t.resourceQueue) == 0 {
+		newChunk := newFirstChunk(t.reader)
+		t.memTracker.Consume(newChunk.MemoryUsage())
+		t.resourceQueue = append(t.resourceQueue, newChunk)
+	}
+
+	// NOTE: "t.curResult" is always the last element of "resultQueue".
+	t.curResult = t.resourceQueue[0]
+	t.curIter = chunk.NewIterator4Chunk(t.curResult)
+	t.resourceQueue = t.resourceQueue[1:]
+	t.resultQueue = append(t.resultQueue, t.curResult)
+	t.curResult.Reset()
+	t.curResultInUse = false
 }
 
 // Close implements the Executor Close interface.
 func (e *MergeJoinExec) Close() error {
-	e.outputBuf = nil
+	e.childrenResults = nil
+	e.memTracker = nil
 
-	lErr := e.leftRowBlock.reader.Close()
-	if lErr != nil {
-		e.rightRowBlock.reader.Close()
-		return errors.Trace(lErr)
-	}
-	rErr := e.rightRowBlock.reader.Close()
-	if rErr != nil {
-		return errors.Trace(rErr)
-	}
-
-	return nil
+	return e.baseExecutor.Close()
 }
+
+var innerTableLabel fmt.Stringer = stringutil.StringerStr("innerTable")
 
 // Open implements the Executor Open interface.
-func (e *MergeJoinExec) Open() error {
+func (e *MergeJoinExec) Open(ctx context.Context) error {
+	if err := e.baseExecutor.Open(ctx); err != nil {
+		return err
+	}
+
 	e.prepared = false
-	e.cursor = 0
-	e.outputBuf = nil
+	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaMergeJoin)
+	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 
-	err := e.leftRowBlock.reader.Open()
-	if err != nil {
-		return errors.Trace(err)
-	}
-	return errors.Trace(e.rightRowBlock.reader.Open())
-}
-
-// Schema implements the Executor Schema interface.
-func (e *MergeJoinExec) Schema() *expression.Schema {
-	return e.schema
-}
-
-func compareKeys(stmtCtx *variable.StatementContext,
-	leftRow Row, leftKeys []*expression.Column,
-	rightRow Row, rightKeys []*expression.Column) (int, error) {
-	for i, leftKey := range leftKeys {
-		lVal, err := leftKey.Eval(leftRow)
-		if err != nil {
-			return 0, errors.Trace(err)
-		}
-
-		rVal, err := rightKeys[i].Eval(rightRow)
-		if err != nil {
-			return 0, errors.Trace(err)
-		}
-
-		ret, err := lVal.CompareDatum(stmtCtx, rVal)
-		if err != nil {
-			return 0, errors.Trace(err)
-		}
-
-		if ret != 0 {
-			return ret, nil
-		}
-	}
-	return 0, nil
-}
-
-func (e *MergeJoinExec) outputJoinRow(leftRow Row, rightRow Row) {
-	var joinedRow Row
-	if e.flipSide {
-		joinedRow = makeJoinRow(rightRow, leftRow)
-	} else {
-		joinedRow = makeJoinRow(leftRow, rightRow)
-	}
-	e.outputBuf = append(e.outputBuf, joinedRow)
-}
-
-func (e *MergeJoinExec) outputFilteredJoinRow(leftRow Row, rightRow Row) error {
-	var joinedRow Row
-	if e.flipSide {
-		joinedRow = makeJoinRow(rightRow, leftRow)
-	} else {
-		joinedRow = makeJoinRow(leftRow, rightRow)
+	e.childrenResults = make([]*chunk.Chunk, 0, len(e.children))
+	for _, child := range e.children {
+		e.childrenResults = append(e.childrenResults, newFirstChunk(child))
 	}
 
-	if e.otherFilter != nil {
-		matched, err := expression.EvalBool(e.otherFilter, joinedRow, e.ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if !matched {
-			return nil
-		}
-	}
-	e.outputBuf = append(e.outputBuf, joinedRow)
-	return nil
-}
-
-func (e *MergeJoinExec) tryOutputLeftRows() error {
-	if e.preserveLeft {
-		for _, lRow := range e.leftRows {
-			e.outputJoinRow(lRow, e.defaultRightRow)
-		}
-	}
-	return nil
-}
-
-func (e *MergeJoinExec) computeCrossProduct() error {
-	var err error
-	for _, lRow := range e.leftRows {
-		// make up for outer join since we ignored single table conditions previously
-		if e.leftFilter != nil {
-			var matched bool
-			matched, err = expression.EvalBool(e.leftFilter, lRow, e.ctx)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			if !matched {
-				// as all right join converted to left, we only output left side if no match and continue
-				if e.preserveLeft {
-					e.outputJoinRow(lRow, e.defaultRightRow)
-				}
-				continue
-			}
-		}
-		// Do the real cross product calculation
-		initInnerLen := len(e.outputBuf)
-		for _, rRow := range e.rightRows {
-			err = e.outputFilteredJoinRow(lRow, rRow)
-			if err != nil {
-				return errors.Trace(err)
-			}
-		}
-		// Even if caught up for left filter
-		// no matching but it's outer join
-		if e.preserveLeft && initInnerLen == len(e.outputBuf) {
-			e.outputJoinRow(lRow, e.defaultRightRow)
-		}
-	}
+	e.innerTable.memTracker = memory.NewTracker(innerTableLabel, -1)
+	e.innerTable.memTracker.AttachTo(e.memTracker)
 
 	return nil
 }
 
-func (e *MergeJoinExec) computeJoin() (bool, error) {
-	e.outputBuf = e.outputBuf[0:0:rowBufferSize]
-
-	for {
-		var compareResult int
-		var err error
-		if e.leftRows == nil || e.rightRows == nil {
-			if e.leftRows != nil && e.rightRows == nil && e.preserveLeft {
-				// left remains and left outer join
-				// -1 will make loop continue for left
-				compareResult = -1
-			} else {
-				// inner join or left is nil
-				return false, nil
-			}
-		} else {
-			// no nil for either side, compare by first elements in row buffer since its guaranteed
-			compareResult, err = compareKeys(e.stmtCtx, e.leftRows[0], e.leftJoinKeys, e.rightRows[0], e.rightJoinKeys)
-
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			if e.desc {
-				compareResult = -compareResult
-			}
-		}
-
-		// Before moving on, in case of outer join, output the side of the row
-		if compareResult > 0 {
-			e.rightRows, err = e.rightRowBlock.nextBlock()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-		} else if compareResult < 0 {
-			initLen := len(e.outputBuf)
-			err := e.tryOutputLeftRows()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			e.leftRows, err = e.leftRowBlock.nextBlock()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			if initLen < len(e.outputBuf) {
-				return true, nil
-			}
-		} else { // key matched, try join with other conditions
-			initLen := len(e.outputBuf)
-
-			// Compute cross product when both sides matches
-			err := e.computeCrossProduct()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-
-			e.leftRows, err = e.leftRowBlock.nextBlock()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			e.rightRows, err = e.rightRowBlock.nextBlock()
-			if err != nil {
-				return false, errors.Trace(err)
-			}
-			if initLen < len(e.outputBuf) {
-				return true, nil
-			}
+func compareChunkRow(cmpFuncs []chunk.CompareFunc, lhsRow, rhsRow chunk.Row, lhsKey, rhsKey []*expression.Column) int {
+	for i := range lhsKey {
+		cmp := cmpFuncs[i](lhsRow, lhsKey[i].Index, rhsRow, rhsKey[i].Index)
+		if cmp != 0 {
+			return cmp
 		}
 	}
+	return 0
 }
 
-func (e *MergeJoinExec) prepare() error {
-	e.stmtCtx = e.ctx.GetSessionVars().StmtCtx
-	err := e.leftRowBlock.init()
+func (e *MergeJoinExec) prepare(ctx context.Context, requiredRows int) error {
+	err := e.innerTable.init(ctx, e.childrenResults[e.outerIdx^1])
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
-	err = e.rightRowBlock.init()
-	if err != nil {
-		return errors.Trace(err)
-	}
-	e.outputBuf = make([]Row, 0, rowBufferSize)
 
-	e.leftRows, err = e.leftRowBlock.nextBlock()
+	err = e.fetchNextInnerRows()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
-	e.rightRows, err = e.rightRowBlock.nextBlock()
+
+	// init outer table.
+	e.outerTable.chk = e.childrenResults[e.outerIdx]
+	e.outerTable.iter = chunk.NewIterator4Chunk(e.outerTable.chk)
+	e.outerTable.selected = make([]bool, 0, e.maxChunkSize)
+
+	err = e.fetchNextOuterRows(ctx, requiredRows)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	e.prepared = true
@@ -498,25 +265,134 @@ func (e *MergeJoinExec) prepare() error {
 }
 
 // Next implements the Executor Next interface.
-func (e *MergeJoinExec) Next() (Row, error) {
-	var err error
-	var hasMore bool
+func (e *MergeJoinExec) Next(ctx context.Context, req *chunk.Chunk) error {
+	req.Reset()
 	if !e.prepared {
-		if err = e.prepare(); err != nil {
-			return nil, errors.Trace(err)
+		if err := e.prepare(ctx, req.RequiredRows()); err != nil {
+			return err
 		}
 	}
-	if e.cursor >= len(e.outputBuf) {
-		hasMore, err = e.computeJoin()
+
+	for !req.IsFull() {
+		hasMore, err := e.joinToChunk(ctx, req)
+		if err != nil || !hasMore {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *MergeJoinExec) joinToChunk(ctx context.Context, chk *chunk.Chunk) (hasMore bool, err error) {
+	for {
+		if e.outerTable.row == e.outerTable.iter.End() {
+			err = e.fetchNextOuterRows(ctx, chk.RequiredRows()-chk.NumRows())
+			if err != nil || e.outerTable.chk.NumRows() == 0 {
+				return false, err
+			}
+		}
+
+		cmpResult := -1
+		if e.outerTable.selected[e.outerTable.row.Idx()] && len(e.innerRows) > 0 {
+			cmpResult, err = e.compare(e.outerTable.row, e.innerIter4Row.Current())
+			if err != nil {
+				return false, err
+			}
+		}
+
+		if cmpResult > 0 {
+			if err = e.fetchNextInnerRows(); err != nil {
+				return false, err
+			}
+			continue
+		}
+
+		if cmpResult < 0 {
+			e.joiner.onMissMatch(false, e.outerTable.row, chk)
+			if err != nil {
+				return false, err
+			}
+
+			e.outerTable.row = e.outerTable.iter.Next()
+			e.outerTable.hasMatch = false
+			e.outerTable.hasNull = false
+
+			if chk.IsFull() {
+				return true, nil
+			}
+			continue
+		}
+
+		matched, isNull, err := e.joiner.tryToMatch(e.outerTable.row, e.innerIter4Row, chk)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return false, err
 		}
-		if !hasMore {
-			return nil, nil
+		e.outerTable.hasMatch = e.outerTable.hasMatch || matched
+		e.outerTable.hasNull = e.outerTable.hasNull || isNull
+
+		if e.innerIter4Row.Current() == e.innerIter4Row.End() {
+			if !e.outerTable.hasMatch {
+				e.joiner.onMissMatch(e.outerTable.hasNull, e.outerTable.row, chk)
+			}
+			e.outerTable.row = e.outerTable.iter.Next()
+			e.outerTable.hasMatch = false
+			e.outerTable.hasNull = false
+			e.innerIter4Row.Begin()
 		}
-		e.cursor = 0
+
+		if chk.IsFull() {
+			return true, err
+		}
 	}
-	row := e.outputBuf[e.cursor]
-	e.cursor++
-	return row, nil
+}
+
+func (e *MergeJoinExec) compare(outerRow, innerRow chunk.Row) (int, error) {
+	outerJoinKeys := e.outerTable.keys
+	innerJoinKeys := e.innerTable.joinKeys
+	for i := range outerJoinKeys {
+		cmp, _, err := e.compareFuncs[i](e.ctx, outerJoinKeys[i], innerJoinKeys[i], outerRow, innerRow)
+		if err != nil {
+			return 0, err
+		}
+
+		if cmp != 0 {
+			return int(cmp), nil
+		}
+	}
+	return 0, nil
+}
+
+// fetchNextInnerRows fetches the next join group, within which all the rows
+// have the same join key, from the inner table.
+func (e *MergeJoinExec) fetchNextInnerRows() (err error) {
+	e.innerRows, err = e.innerTable.rowsWithSameKey()
+	if err != nil {
+		return err
+	}
+	e.innerIter4Row = chunk.NewIterator4Slice(e.innerRows)
+	e.innerIter4Row.Begin()
+	return nil
+}
+
+// fetchNextOuterRows fetches the next Chunk of outer table. Rows in a Chunk
+// may not all belong to the same join key, but are guaranteed to be sorted
+// according to the join key.
+func (e *MergeJoinExec) fetchNextOuterRows(ctx context.Context, requiredRows int) (err error) {
+	// It's hard to calculate selectivity if there is any filter or it's inner join,
+	// so we just push the requiredRows down when it's outer join and has no filter.
+	if e.isOuterJoin && len(e.outerTable.filter) == 0 {
+		e.outerTable.chk.SetRequiredRows(requiredRows, e.maxChunkSize)
+	}
+
+	err = Next(ctx, e.outerTable.reader, e.outerTable.chk)
+	if err != nil {
+		return err
+	}
+
+	e.outerTable.iter.Begin()
+	e.outerTable.selected, err = expression.VectorizedFilter(e.ctx, e.outerTable.filter, e.outerTable.iter, e.outerTable.selected)
+	if err != nil {
+		return err
+	}
+	e.outerTable.row = e.outerTable.iter.Begin()
+	return nil
 }

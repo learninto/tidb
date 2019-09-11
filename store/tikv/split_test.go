@@ -14,13 +14,15 @@
 package tikv
 
 import (
+	"context"
+
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/store/tikv/mock-tikv"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 )
 
 type testSplitSuite struct {
+	OneByOneSuite
 	cluster *mocktikv.Cluster
 	store   *tikvStore
 	bo      *Backoffer
@@ -31,10 +33,13 @@ var _ = Suite(&testSplitSuite{})
 func (s *testSplitSuite) SetUpTest(c *C) {
 	s.cluster = mocktikv.NewCluster()
 	mocktikv.BootstrapWithSingleStore(s.cluster)
-	store, err := NewMockTikvStore(WithCluster(s.cluster))
+	client, pdClient, err := mocktikv.NewTiKVAndPDClient(s.cluster, nil, "")
+	c.Assert(err, IsNil)
+
+	store, err := NewTestTiKVStore(client, pdClient, nil, nil, 0)
 	c.Check(err, IsNil)
 	s.store = store.(*tikvStore)
-	s.bo = NewBackoffer(5000, context.Background())
+	s.bo = NewBackoffer(context.Background(), 5000)
 }
 
 func (s *testSplitSuite) begin(c *C) *tikvTxn {
@@ -53,10 +58,10 @@ func (s *testSplitSuite) TestSplitBatchGet(c *C) {
 	c.Assert(err, IsNil)
 
 	txn := s.begin(c)
-	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()})
+	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()}, 0)
 
 	keys := [][]byte{{'a'}, {'b'}, {'c'}}
-	_, region, err := s.store.regionCache.GroupKeysByRegion(s.bo, keys)
+	_, region, err := s.store.regionCache.GroupKeysByRegion(s.bo, keys, nil)
 	c.Assert(err, IsNil)
 	batch := batchKeys{
 		region: region,
@@ -64,9 +69,9 @@ func (s *testSplitSuite) TestSplitBatchGet(c *C) {
 	}
 
 	s.split(c, loc.Region.id, []byte("b"))
-	s.store.regionCache.DropRegion(loc.Region)
+	s.store.regionCache.InvalidateCachedRegion(loc.Region)
 
-	// mock-tikv will panic if it meets a not-in-region key.
+	// mocktikv will panic if it meets a not-in-region key.
 	err = snapshot.batchGetSingleRegion(s.bo, batch, func([]byte, []byte) {})
 	c.Assert(err, IsNil)
 }
@@ -83,7 +88,7 @@ func (s *testSplitSuite) TestStaleEpoch(c *C) {
 	c.Assert(err, IsNil)
 	err = txn.Set([]byte("c"), []byte("c"))
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
 	// Initiate a split and disable the PD client. If it still works, the
@@ -92,8 +97,8 @@ func (s *testSplitSuite) TestStaleEpoch(c *C) {
 	mockPDClient.disable()
 
 	txn = s.begin(c)
-	_, err = txn.Get([]byte("a"))
+	_, err = txn.Get(context.TODO(), []byte("a"))
 	c.Assert(err, IsNil)
-	_, err = txn.Get([]byte("c"))
+	_, err = txn.Get(context.TODO(), []byte("c"))
 	c.Assert(err, IsNil)
 }

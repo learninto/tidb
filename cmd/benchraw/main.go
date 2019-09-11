@@ -22,9 +22,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/ngaut/log"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/log"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/store/tikv"
+	"go.uber.org/zap"
 )
 
 var (
@@ -32,13 +35,20 @@ var (
 	workerCnt = flag.Int("C", 100, "concurrent num")
 	pdAddr    = flag.String("pd", "localhost:2379", "pd address:localhost:2379")
 	valueSize = flag.Int("V", 5, "value size in byte")
+	sslCA     = flag.String("cacert", "", "path of file that contains list of trusted SSL CAs.")
+	sslCert   = flag.String("cert", "", "path of file that contains X509 certificate in PEM format.")
+	sslKey    = flag.String("key", "", "path of file that contains X509 key in PEM format.")
 )
 
 // batchRawPut blinds put bench.
 func batchRawPut(value []byte) {
-	cli, err := tikv.NewRawKVClient(strings.Split(*pdAddr, ","))
+	cli, err := tikv.NewRawKVClient(strings.Split(*pdAddr, ","), config.Security{
+		ClusterSSLCA:   *sslCA,
+		ClusterSSLCert: *sslCert,
+		ClusterSSLKey:  *sslKey,
+	})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err.Error())
 	}
 
 	wg := sync.WaitGroup{}
@@ -53,7 +63,7 @@ func batchRawPut(value []byte) {
 				key := fmt.Sprintf("key_%d", k)
 				err = cli.Put([]byte(key), value)
 				if err != nil {
-					log.Fatal(errors.ErrorStack(err))
+					log.Fatal("put failed", zap.Error(err))
 				}
 			}
 		}(i)
@@ -63,8 +73,11 @@ func batchRawPut(value []byte) {
 
 func main() {
 	flag.Parse()
-	log.SetLevelByString("warn")
-	go http.ListenAndServe(":9191", nil)
+	log.SetLevel(zap.WarnLevel)
+	go func() {
+		err := http.ListenAndServe(":9191", nil)
+		terror.Log(errors.Trace(err))
+	}()
 
 	value := make([]byte, *valueSize)
 	t := time.Now()

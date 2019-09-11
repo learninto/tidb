@@ -14,7 +14,8 @@
 package kv
 
 import (
-	"github.com/juju/errors"
+	"context"
+
 	"github.com/pingcap/tidb/store/tikv/oracle"
 )
 
@@ -24,9 +25,9 @@ type mockTxn struct {
 	valid bool
 }
 
-// Always returns a retryable error.
-func (t *mockTxn) Commit() error {
-	return ErrRetryable
+// Commit always returns a retryable error.
+func (t *mockTxn) Commit(ctx context.Context) error {
+	return ErrTxnRetryable
 }
 
 func (t *mockTxn) Rollback() error {
@@ -38,18 +39,16 @@ func (t *mockTxn) String() string {
 	return ""
 }
 
-func (t *mockTxn) LockKeys(keys ...Key) error {
+func (t *mockTxn) LockKeys(_ context.Context, _ uint64, _ ...Key) error {
 	return nil
 }
 
 func (t *mockTxn) SetOption(opt Option, val interface{}) {
 	t.opts[opt] = val
-	return
 }
 
 func (t *mockTxn) DelOption(opt Option) {
 	delete(t.opts, opt)
-	return
 }
 
 func (t *mockTxn) GetOption(opt Option) interface{} {
@@ -63,15 +62,19 @@ func (t *mockTxn) IsReadOnly() bool {
 func (t *mockTxn) StartTS() uint64 {
 	return uint64(0)
 }
-func (t *mockTxn) Get(k Key) ([]byte, error) {
+func (t *mockTxn) Get(ctx context.Context, k Key) ([]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) Seek(k Key) (Iterator, error) {
+func (t *mockTxn) BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) SeekReverse(k Key) (Iterator, error) {
+func (t *mockTxn) Iter(k Key, upperBound Key) (Iterator, error) {
+	return nil, nil
+}
+
+func (t *mockTxn) IterReverse(k Key) (Iterator, error) {
 	return nil, nil
 }
 
@@ -94,16 +97,43 @@ func (t *mockTxn) Size() int {
 	return 0
 }
 
+func (t *mockTxn) GetMemBuffer() MemBuffer {
+	return nil
+}
+
+func (t *mockTxn) SetCap(cap int) {
+
+}
+
+func (t *mockTxn) Reset() {
+	t.valid = false
+}
+
+func (t *mockTxn) SetVars(vars *Variables) {
+
+}
+
+func (t *mockTxn) SetAssertion(key Key, assertion AssertionType) {}
+func (t *mockTxn) ConfirmAssertions(succ bool)                   {}
+
+// NewMockTxn new a mockTxn.
+func NewMockTxn() Transaction {
+	return &mockTxn{
+		opts:  make(map[Option]interface{}),
+		valid: true,
+	}
+}
+
 // mockStorage is used to start a must commit-failed txn.
 type mockStorage struct {
 }
 
 func (s *mockStorage) Begin() (Transaction, error) {
-	tx := &mockTxn{
-		opts:  make(map[Option]interface{}),
-		valid: true,
-	}
-	return tx, nil
+	return NewMockTxn(), nil
+}
+
+func (*mockTxn) IsPessimistic() bool {
+	return false
 }
 
 // BeginWithStartTS begins a transaction with startTS.
@@ -113,7 +143,7 @@ func (s *mockStorage) BeginWithStartTS(startTS uint64) (Transaction, error) {
 
 func (s *mockStorage) GetSnapshot(ver Version) (Snapshot, error) {
 	return &mockSnapshot{
-		store: NewMemDbBuffer(),
+		store: NewMemDbBuffer(DefaultTxnMembufCap),
 	}, nil
 }
 
@@ -142,6 +172,18 @@ func (s *mockStorage) SupportDeleteRange() (supported bool) {
 	return false
 }
 
+func (s *mockStorage) Name() string {
+	return "KVMockStorage"
+}
+
+func (s *mockStorage) Describe() string {
+	return "KVMockStorage is a mock Store implementation, only for unittests in KV package"
+}
+
+func (s *mockStorage) ShowStatus(ctx context.Context, key string) (interface{}, error) {
+	return nil, nil
+}
+
 // MockTxn is used for test cases that need more interfaces than Transaction.
 type MockTxn interface {
 	Transaction
@@ -157,29 +199,36 @@ type mockSnapshot struct {
 	store MemBuffer
 }
 
-func (s *mockSnapshot) Get(k Key) ([]byte, error) {
-	return s.store.Get(k)
+func (s *mockSnapshot) Get(ctx context.Context, k Key) ([]byte, error) {
+	return s.store.Get(ctx, k)
 }
 
-func (s *mockSnapshot) BatchGet(keys []Key) (map[string][]byte, error) {
+func (s *mockSnapshot) SetPriority(priority int) {
+
+}
+
+func (s *mockSnapshot) BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for _, k := range keys {
-		v, err := s.store.Get(k)
+		v, err := s.store.Get(ctx, k)
 		if IsErrNotFound(err) {
 			continue
 		}
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		m[string(k)] = v
 	}
 	return m, nil
 }
 
-func (s *mockSnapshot) Seek(k Key) (Iterator, error) {
-	return s.store.Seek(k)
+func (s *mockSnapshot) Iter(k Key, upperBound Key) (Iterator, error) {
+	return s.store.Iter(k, upperBound)
 }
 
-func (s *mockSnapshot) SeekReverse(k Key) (Iterator, error) {
-	return s.store.SeekReverse(k)
+func (s *mockSnapshot) IterReverse(k Key) (Iterator, error) {
+	return s.store.IterReverse(k)
 }
+
+func (s *mockSnapshot) SetOption(opt Option, val interface{}) {}
+func (s *mockSnapshot) DelOption(opt Option)                  {}

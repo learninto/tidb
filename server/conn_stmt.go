@@ -35,77 +35,81 @@
 package server
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strconv"
+	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/hack"
 )
 
 func (cc *clientConn) handleStmtPrepare(sql string) error {
 	stmt, columns, params, err := cc.ctx.Prepare(sql)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	data := make([]byte, 4, 128)
 
 	//status ok
 	data = append(data, 0)
 	//stmt id
-	data = append(data, dumpUint32(uint32(stmt.ID()))...)
+	data = dumpUint32(data, uint32(stmt.ID()))
 	//number columns
-	data = append(data, dumpUint16(uint16(len(columns)))...)
+	data = dumpUint16(data, uint16(len(columns)))
 	//number params
-	data = append(data, dumpUint16(uint16(len(params)))...)
+	data = dumpUint16(data, uint16(len(params)))
 	//filter [00]
 	data = append(data, 0)
 	//warning count
 	data = append(data, 0, 0) //TODO support warning count
 
 	if err := cc.writePacket(data); err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
 	if len(params) > 0 {
 		for i := 0; i < len(params); i++ {
 			data = data[0:4]
-			data = append(data, params[i].Dump(cc.alloc)...)
+			data = params[i].Dump(data)
 
 			if err := cc.writePacket(data); err != nil {
-				return errors.Trace(err)
+				return err
 			}
 		}
 
-		if err := cc.writeEOF(false); err != nil {
-			return errors.Trace(err)
+		if err := cc.writeEOF(0); err != nil {
+			return err
 		}
 	}
 
 	if len(columns) > 0 {
 		for i := 0; i < len(columns); i++ {
 			data = data[0:4]
-			data = append(data, columns[i].Dump(cc.alloc)...)
+			data = columns[i].Dump(data)
 
 			if err := cc.writePacket(data); err != nil {
-				return errors.Trace(err)
+				return err
 			}
 		}
 
-		if err := cc.writeEOF(false); err != nil {
-			return errors.Trace(err)
+		if err := cc.writeEOF(0); err != nil {
+			return err
 		}
 
 	}
-	return errors.Trace(cc.flush())
+	return cc.flush()
 }
 
-func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
+func (cc *clientConn) handleStmtExecute(ctx context.Context, data []byte) (err error) {
 	if len(data) < 9 {
 		return mysql.ErrMalformPacket
 	}
-
 	pos := 0
 	stmtID := binary.LittleEndian.Uint32(data[0:4])
 	pos += 4
@@ -118,8 +122,20 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 
 	flag := data[pos]
 	pos++
-	// Now we only support CURSOR_TYPE_NO_CURSOR flag.
-	if flag != 0 {
+	// Please refer to https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
+	// The client indicates that it wants to use cursor by setting this flag.
+	// 0x00 CURSOR_TYPE_NO_CURSOR
+	// 0x01 CURSOR_TYPE_READ_ONLY
+	// 0x02 CURSOR_TYPE_FOR_UPDATE
+	// 0x04 CURSOR_TYPE_SCROLLABLE
+	// Now we only support forward-only, read-only cursor.
+	var useCursor bool
+	switch flag {
+	case 0:
+		useCursor = false
+	case 1:
+		useCursor = true
+	default:
 		return mysql.NewErrf(mysql.ErrUnknown, "unsupported flag %d", flag)
 	}
 
@@ -132,7 +148,7 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 		paramValues []byte
 	)
 	numParams := stmt.NumParams()
-	args := make([]interface{}, numParams)
+	args := make([]types.Datum, numParams)
 	if numParams > 0 {
 		nullBitmapLen := (numParams + 7) >> 3
 		if len(data) < (pos + nullBitmapLen + 1) {
@@ -149,7 +165,7 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 			}
 
 			paramTypes = data[pos : pos+(numParams<<1)]
-			pos += (numParams << 1)
+			pos += numParams << 1
 			paramValues = data[pos:]
 			// Just the first StmtExecute packet contain parameters type,
 			// we need save it for further use.
@@ -158,35 +174,105 @@ func (cc *clientConn) handleStmtExecute(data []byte) (err error) {
 			paramValues = data[pos+1:]
 		}
 
-		err = parseStmtArgs(args, stmt.BoundParams(), nullBitmaps, stmt.GetParamsType(), paramValues)
+		err = parseExecArgs(cc.ctx.GetSessionVars().StmtCtx, args, stmt.BoundParams(), nullBitmaps, stmt.GetParamsType(), paramValues)
+		stmt.Reset()
 		if err != nil {
-			return errors.Trace(err)
+			return errors.Annotatef(err, "%s", cc.preparedStmt2String(stmtID))
 		}
 	}
-	rs, err := stmt.Execute(args...)
+	rs, err := stmt.Execute(ctx, args)
 	if err != nil {
-		return errors.Trace(err)
+		return errors.Annotatef(err, "%s", cc.preparedStmt2String(stmtID))
 	}
 	if rs == nil {
-		return errors.Trace(cc.writeOK())
+		return cc.writeOK()
 	}
 
-	return errors.Trace(cc.writeResultset(rs, true, false))
+	// if the client wants to use cursor
+	// we should hold the ResultSet in PreparedStatement for next stmt_fetch, and only send back ColumnInfo.
+	// Tell the client cursor exists in server by setting proper serverStatus.
+	if useCursor {
+		stmt.StoreResultSet(rs)
+		err = cc.writeColumnInfo(rs.Columns(), mysql.ServerStatusCursorExists)
+		if err != nil {
+			return err
+		}
+		// explicitly flush columnInfo to client.
+		return cc.flush()
+	}
+	return cc.writeResultset(ctx, rs, true, 0, 0)
 }
 
-func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTypes, paramValues []byte) (err error) {
+// maxFetchSize constants
+const (
+	maxFetchSize = 1024
+)
+
+func (cc *clientConn) handleStmtFetch(ctx context.Context, data []byte) (err error) {
+
+	stmtID, fetchSize, err := parseStmtFetchCmd(data)
+	if err != nil {
+		return err
+	}
+
+	stmt := cc.ctx.GetStatement(int(stmtID))
+	if stmt == nil {
+		return mysql.NewErr(mysql.ErrUnknownStmtHandler,
+			strconv.FormatUint(uint64(stmtID), 10), "stmt_fetch")
+	}
+	sql := ""
+	if prepared, ok := cc.ctx.GetStatement(int(stmtID)).(*TiDBStatement); ok {
+		sql = prepared.sql
+	}
+	cc.ctx.SetProcessInfo(sql, time.Now(), mysql.ComStmtExecute, 0)
+	rs := stmt.GetResultSet()
+	if rs == nil {
+		return mysql.NewErr(mysql.ErrUnknownStmtHandler,
+			strconv.FormatUint(uint64(stmtID), 10), "stmt_fetch_rs")
+	}
+
+	return cc.writeResultset(ctx, rs, true, mysql.ServerStatusCursorExists, int(fetchSize))
+}
+
+func parseStmtFetchCmd(data []byte) (uint32, uint32, error) {
+	if len(data) != 8 {
+		return 0, 0, mysql.ErrMalformPacket
+	}
+	// Please refer to https://dev.mysql.com/doc/internals/en/com-stmt-fetch.html
+	stmtID := binary.LittleEndian.Uint32(data[0:4])
+	fetchSize := binary.LittleEndian.Uint32(data[4:8])
+	if fetchSize > maxFetchSize {
+		fetchSize = maxFetchSize
+	}
+	return stmtID, fetchSize, nil
+}
+
+func parseExecArgs(sc *stmtctx.StatementContext, args []types.Datum, boundParams [][]byte, nullBitmap, paramTypes, paramValues []byte) (err error) {
 	pos := 0
-	var v []byte
-	var n int
-	var isNull bool
+	var (
+		tmp    interface{}
+		v      []byte
+		n      int
+		isNull bool
+	)
 
 	for i := 0; i < len(args); i++ {
-		if nullBitmap[i>>3]&(1<<(uint(i)%8)) > 0 {
-			args[i] = nil
+		// if params had received via ComStmtSendLongData, use them directly.
+		// ref https://dev.mysql.com/doc/internals/en/com-stmt-send-long-data.html
+		// see clientConn#handleStmtSendLongData
+		if boundParams[i] != nil {
+			args[i] = types.NewBytesDatum(boundParams[i])
 			continue
 		}
-		if boundParams[i] != nil {
-			args[i] = boundParams[i]
+
+		// check nullBitMap to determine the NULL arguments.
+		// ref https://dev.mysql.com/doc/internals/en/com-stmt-execute.html
+		// notice: some client(e.g. mariadb) will set nullBitMap even if data had be sent via ComStmtSendLongData,
+		// so this check need place after boundParam's check.
+		if nullBitmap[i>>3]&(1<<(uint(i)%8)) > 0 {
+			var nilDatum types.Datum
+			nilDatum.SetNull()
+			args[i] = nilDatum
 			continue
 		}
 
@@ -199,7 +285,9 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 
 		switch tp {
 		case mysql.TypeNull:
-			args[i] = nil
+			var nilDatum types.Datum
+			nilDatum.SetNull()
+			args[i] = nilDatum
 			continue
 
 		case mysql.TypeTiny:
@@ -209,9 +297,9 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 			}
 
 			if isUnsigned {
-				args[i] = uint64(paramValues[pos])
+				args[i] = types.NewUintDatum(uint64(uint8(paramValues[pos])))
 			} else {
-				args[i] = int64(paramValues[pos])
+				args[i] = types.NewIntDatum(int64(int8(paramValues[pos])))
 			}
 
 			pos++
@@ -224,9 +312,9 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 			}
 			valU16 := binary.LittleEndian.Uint16(paramValues[pos : pos+2])
 			if isUnsigned {
-				args[i] = uint64(valU16)
+				args[i] = types.NewUintDatum(uint64(uint16(valU16)))
 			} else {
-				args[i] = int64(valU16)
+				args[i] = types.NewIntDatum(int64(int16(valU16)))
 			}
 			pos += 2
 			continue
@@ -238,9 +326,9 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 			}
 			valU32 := binary.LittleEndian.Uint32(paramValues[pos : pos+4])
 			if isUnsigned {
-				args[i] = uint64(valU32)
+				args[i] = types.NewUintDatum(uint64(uint32(valU32)))
 			} else {
-				args[i] = int64(valU32)
+				args[i] = types.NewIntDatum(int64(int32(valU32)))
 			}
 			pos += 4
 			continue
@@ -252,9 +340,9 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 			}
 			valU64 := binary.LittleEndian.Uint64(paramValues[pos : pos+8])
 			if isUnsigned {
-				args[i] = valU64
+				args[i] = types.NewUintDatum(valU64)
 			} else {
-				args[i] = int64(valU64)
+				args[i] = types.NewIntDatum(int64(valU64))
 			}
 			pos += 8
 			continue
@@ -265,7 +353,7 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 				return
 			}
 
-			args[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(paramValues[pos : pos+4])))
+			args[i] = types.NewFloat32Datum(math.Float32frombits(binary.LittleEndian.Uint32(paramValues[pos : pos+4])))
 			pos += 4
 			continue
 
@@ -275,16 +363,111 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 				return
 			}
 
-			args[i] = math.Float64frombits(binary.LittleEndian.Uint64(paramValues[pos : pos+8]))
+			args[i] = types.NewFloat64Datum(math.Float64frombits(binary.LittleEndian.Uint64(paramValues[pos : pos+8])))
 			pos += 8
 			continue
 
-		case mysql.TypeUnspecified, mysql.TypeNewDecimal, mysql.TypeVarchar,
-			mysql.TypeBit, mysql.TypeEnum, mysql.TypeSet, mysql.TypeTinyBlob,
-			mysql.TypeMediumBlob, mysql.TypeLongBlob, mysql.TypeBlob,
-			mysql.TypeVarString, mysql.TypeString, mysql.TypeGeometry,
-			mysql.TypeDate, mysql.TypeNewDate,
-			mysql.TypeTimestamp, mysql.TypeDatetime, mysql.TypeDuration:
+		case mysql.TypeDate, mysql.TypeTimestamp, mysql.TypeDatetime:
+			if len(paramValues) < (pos + 1) {
+				err = mysql.ErrMalformPacket
+				return
+			}
+			// See https://dev.mysql.com/doc/internals/en/binary-protocol-value.html
+			// for more details.
+			length := uint8(paramValues[pos])
+			pos++
+			switch length {
+			case 0:
+				tmp = types.ZeroDatetimeStr
+			case 4:
+				pos, tmp = parseBinaryDate(pos, paramValues)
+			case 7:
+				pos, tmp = parseBinaryDateTime(pos, paramValues)
+			case 11:
+				pos, tmp = parseBinaryTimestamp(pos, paramValues)
+			default:
+				err = mysql.ErrMalformPacket
+				return
+			}
+			args[i] = types.NewDatum(tmp) // FIXME: After check works!!!!!!
+			continue
+
+		case mysql.TypeDuration:
+			if len(paramValues) < (pos + 1) {
+				err = mysql.ErrMalformPacket
+				return
+			}
+			// See https://dev.mysql.com/doc/internals/en/binary-protocol-value.html
+			// for more details.
+			length := uint8(paramValues[pos])
+			pos++
+			switch length {
+			case 0:
+				tmp = "0"
+			case 8:
+				isNegative := uint8(paramValues[pos])
+				if isNegative > 1 {
+					err = mysql.ErrMalformPacket
+					return
+				}
+				pos++
+				pos, tmp = parseBinaryDuration(pos, paramValues, isNegative)
+			case 12:
+				isNegative := uint8(paramValues[pos])
+				if isNegative > 1 {
+					err = mysql.ErrMalformPacket
+					return
+				}
+				pos++
+				pos, tmp = parseBinaryDurationWithMS(pos, paramValues, isNegative)
+			default:
+				err = mysql.ErrMalformPacket
+				return
+			}
+			args[i] = types.NewDatum(tmp)
+			continue
+		case mysql.TypeNewDecimal:
+			if len(paramValues) < (pos + 1) {
+				err = mysql.ErrMalformPacket
+				return
+			}
+
+			v, isNull, n, err = parseLengthEncodedBytes(paramValues[pos:])
+			pos += n
+			if err != nil {
+				return
+			}
+
+			if isNull {
+				args[i] = types.NewDecimalDatum(nil)
+			} else {
+				var dec types.MyDecimal
+				err = sc.HandleTruncate(dec.FromString(v))
+				if err != nil {
+					return err
+				}
+				args[i] = types.NewDecimalDatum(&dec)
+			}
+			continue
+		case mysql.TypeBlob, mysql.TypeTinyBlob, mysql.TypeMediumBlob, mysql.TypeLongBlob:
+			if len(paramValues) < (pos + 1) {
+				err = mysql.ErrMalformPacket
+				return
+			}
+			v, isNull, n, err = parseLengthEncodedBytes(paramValues[pos:])
+			pos += n
+			if err != nil {
+				return
+			}
+
+			if isNull {
+				args[i] = types.NewBytesDatum(nil)
+			} else {
+				args[i] = types.NewBytesDatum(v)
+			}
+			continue
+		case mysql.TypeUnspecified, mysql.TypeVarchar, mysql.TypeVarString, mysql.TypeString,
+			mysql.TypeEnum, mysql.TypeSet, mysql.TypeGeometry, mysql.TypeBit:
 			if len(paramValues) < (pos + 1) {
 				err = mysql.ErrMalformPacket
 				return
@@ -297,17 +480,70 @@ func parseStmtArgs(args []interface{}, boundParams [][]byte, nullBitmap, paramTy
 			}
 
 			if !isNull {
-				args[i] = hack.String(v)
+				tmp = string(hack.String(v))
 			} else {
-				args[i] = nil
+				tmp = nil
 			}
+			args[i] = types.NewDatum(tmp)
 			continue
 		default:
-			err = errUnknownFieldType.Gen("stmt unknown field type %d", tp)
+			err = errUnknownFieldType.GenWithStack("stmt unknown field type %d", tp)
 			return
 		}
 	}
 	return
+}
+
+func parseBinaryDate(pos int, paramValues []byte) (int, string) {
+	year := binary.LittleEndian.Uint16(paramValues[pos : pos+2])
+	pos += 2
+	month := uint8(paramValues[pos])
+	pos++
+	day := uint8(paramValues[pos])
+	pos++
+	return pos, fmt.Sprintf("%04d-%02d-%02d", year, month, day)
+}
+
+func parseBinaryDateTime(pos int, paramValues []byte) (int, string) {
+	pos, date := parseBinaryDate(pos, paramValues)
+	hour := uint8(paramValues[pos])
+	pos++
+	minute := uint8(paramValues[pos])
+	pos++
+	second := uint8(paramValues[pos])
+	pos++
+	return pos, fmt.Sprintf("%s %02d:%02d:%02d", date, hour, minute, second)
+}
+
+func parseBinaryTimestamp(pos int, paramValues []byte) (int, string) {
+	pos, dateTime := parseBinaryDateTime(pos, paramValues)
+	microSecond := binary.LittleEndian.Uint32(paramValues[pos : pos+4])
+	pos += 4
+	return pos, fmt.Sprintf("%s.%06d", dateTime, microSecond)
+}
+
+func parseBinaryDuration(pos int, paramValues []byte, isNegative uint8) (int, string) {
+	sign := ""
+	if isNegative == 1 {
+		sign = "-"
+	}
+	days := binary.LittleEndian.Uint32(paramValues[pos : pos+4])
+	pos += 4
+	hours := uint8(paramValues[pos])
+	pos++
+	minutes := uint8(paramValues[pos])
+	pos++
+	seconds := uint8(paramValues[pos])
+	pos++
+	return pos, fmt.Sprintf("%s%d %02d:%02d:%02d", sign, days, hours, minutes, seconds)
+}
+
+func parseBinaryDurationWithMS(pos int, paramValues []byte,
+	isNegative uint8) (int, string) {
+	pos, dur := parseBinaryDuration(pos, paramValues, isNegative)
+	microSecond := binary.LittleEndian.Uint32(paramValues[pos : pos+4])
+	pos += 4
+	return pos, fmt.Sprintf("%s.%06d", dur, microSecond)
 }
 
 func (cc *clientConn) handleStmtClose(data []byte) (err error) {
@@ -318,7 +554,7 @@ func (cc *clientConn) handleStmtClose(data []byte) (err error) {
 	stmtID := int(binary.LittleEndian.Uint32(data[0:4]))
 	stmt := cc.ctx.GetStatement(stmtID)
 	if stmt != nil {
-		return errors.Trace(stmt.Close())
+		return stmt.Close()
 	}
 	return
 }
@@ -355,7 +591,7 @@ func (cc *clientConn) handleStmtReset(data []byte) (err error) {
 	return cc.writeOK()
 }
 
-// See https://dev.mysql.com/doc/internals/en/com-set-option.html
+// handleSetOption refer to https://dev.mysql.com/doc/internals/en/com-set-option.html
 func (cc *clientConn) handleSetOption(data []byte) (err error) {
 	if len(data) < 2 {
 		return mysql.ErrMalformPacket
@@ -371,9 +607,17 @@ func (cc *clientConn) handleSetOption(data []byte) (err error) {
 	default:
 		return mysql.ErrMalformPacket
 	}
-	if err = cc.writeEOF(false); err != nil {
-		return errors.Trace(err)
+	if err = cc.writeEOF(0); err != nil {
+		return err
 	}
 
-	return errors.Trace(cc.flush())
+	return cc.flush()
+}
+
+func (cc *clientConn) preparedStmt2String(stmtID uint32) string {
+	sv := cc.ctx.GetSessionVars()
+	if prepared, ok := sv.PreparedStmts[stmtID]; ok {
+		return prepared.Stmt.Text() + sv.GetExecuteArgumentsInfo()
+	}
+	return fmt.Sprintf("prepared statement not found, ID: %d", stmtID)
 }

@@ -14,15 +14,19 @@
 package tikv
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
+	pb "github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 type testSnapshotSuite struct {
+	OneByOneSuite
 	store   *tikvStore
 	prefix  string
 	rowNums []int
@@ -31,14 +35,15 @@ type testSnapshotSuite struct {
 var _ = Suite(&testSnapshotSuite{})
 
 func (s *testSnapshotSuite) SetUpSuite(c *C) {
-	s.store = newTestStore(c)
+	s.OneByOneSuite.SetUpSuite(c)
+	s.store = NewTestStore(c).(*tikvStore)
 	s.prefix = fmt.Sprintf("snapshot_%d", time.Now().Unix())
 	s.rowNums = append(s.rowNums, 1, 100, 191)
 }
 
 func (s *testSnapshotSuite) TearDownSuite(c *C) {
 	txn := s.beginTxn(c)
-	scanner, err := txn.Seek(encodeKey(s.prefix, ""))
+	scanner, err := txn.Iter(encodeKey(s.prefix, ""), nil)
 	c.Assert(err, IsNil)
 	c.Assert(scanner, NotNil)
 	for scanner.Valid() {
@@ -47,10 +52,11 @@ func (s *testSnapshotSuite) TearDownSuite(c *C) {
 		c.Assert(err, IsNil)
 		scanner.Next()
 	}
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 	err = s.store.Close()
 	c.Assert(err, IsNil)
+	s.OneByOneSuite.TearDownSuite(c)
 }
 
 func (s *testSnapshotSuite) beginTxn(c *C) *tikvTxn {
@@ -61,11 +67,11 @@ func (s *testSnapshotSuite) beginTxn(c *C) *tikvTxn {
 
 func (s *testSnapshotSuite) checkAll(keys []kv.Key, c *C) {
 	txn := s.beginTxn(c)
-	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()})
-	m, err := snapshot.BatchGet(keys)
+	snapshot := newTiKVSnapshot(s.store, kv.Version{Ver: txn.StartTS()}, 0)
+	m, err := snapshot.BatchGet(context.Background(), keys)
 	c.Assert(err, IsNil)
 
-	scan, err := txn.Seek(encodeKey(s.prefix, ""))
+	scan, err := txn.Iter(encodeKey(s.prefix, ""), nil)
 	c.Assert(err, IsNil)
 	cnt := 0
 	for scan.Valid() {
@@ -77,7 +83,7 @@ func (s *testSnapshotSuite) checkAll(keys []kv.Key, c *C) {
 		c.Assert(v, BytesEquals, v2)
 		scan.Next()
 	}
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 	c.Assert(m, HasLen, cnt)
 }
@@ -88,20 +94,21 @@ func (s *testSnapshotSuite) deleteKeys(keys []kv.Key, c *C) {
 		err := txn.Delete(k)
 		c.Assert(err, IsNil)
 	}
-	err := txn.Commit()
+	err := txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 }
 
 func (s *testSnapshotSuite) TestBatchGet(c *C) {
 	for _, rowNum := range s.rowNums {
-		log.Debugf("Test BatchGet with length[%d]", rowNum)
+		logutil.BgLogger().Debug("test BatchGet",
+			zap.Int("length", rowNum))
 		txn := s.beginTxn(c)
 		for i := 0; i < rowNum; i++ {
 			k := encodeKey(s.prefix, s08d("key", i))
 			err := txn.Set(k, valueBytes(i))
 			c.Assert(err, IsNil)
 		}
-		err := txn.Commit()
+		err := txn.Commit(context.Background())
 		c.Assert(err, IsNil)
 
 		keys := makeKeys(rowNum, s.prefix)
@@ -112,14 +119,15 @@ func (s *testSnapshotSuite) TestBatchGet(c *C) {
 
 func (s *testSnapshotSuite) TestBatchGetNotExist(c *C) {
 	for _, rowNum := range s.rowNums {
-		log.Debugf("Test BatchGetNotExist with length[%d]", rowNum)
+		logutil.BgLogger().Debug("test BatchGetNotExist",
+			zap.Int("length", rowNum))
 		txn := s.beginTxn(c)
 		for i := 0; i < rowNum; i++ {
 			k := encodeKey(s.prefix, s08d("key", i))
 			err := txn.Set(k, valueBytes(i))
 			c.Assert(err, IsNil)
 		}
-		err := txn.Commit()
+		err := txn.Commit(context.Background())
 		c.Assert(err, IsNil)
 
 		keys := makeKeys(rowNum, s.prefix)
@@ -136,4 +144,21 @@ func makeKeys(rowNum int, prefix string) []kv.Key {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+func (s *testSnapshotSuite) TestWriteConflictPrettyFormat(c *C) {
+	conflict := &pb.WriteConflict{
+		StartTs:          399402937522847774,
+		ConflictTs:       399402937719455772,
+		ConflictCommitTs: 399402937719455773,
+		Key:              []byte{116, 128, 0, 0, 0, 0, 0, 1, 155, 95, 105, 128, 0, 0, 0, 0, 0, 0, 1, 1, 82, 87, 48, 49, 0, 0, 0, 0, 251, 1, 55, 54, 56, 50, 50, 49, 49, 48, 255, 57, 0, 0, 0, 0, 0, 0, 0, 248, 1, 0, 0, 0, 0, 0, 0, 0, 0, 247},
+		Primary:          []byte{116, 128, 0, 0, 0, 0, 0, 1, 155, 95, 105, 128, 0, 0, 0, 0, 0, 0, 1, 1, 82, 87, 48, 49, 0, 0, 0, 0, 251, 1, 55, 54, 56, 50, 50, 49, 49, 48, 255, 57, 0, 0, 0, 0, 0, 0, 0, 248, 1, 0, 0, 0, 0, 0, 0, 0, 0, 247},
+	}
+
+	expectedStr := "[kv:9007]Write conflict, " +
+		"txnStartTS=399402937522847774, conflictStartTS=399402937719455772, conflictCommitTS=399402937719455773, " +
+		"key={tableID=411, indexID=1, indexValues={RW01, 768221109, , }} " +
+		"primary={tableID=411, indexID=1, indexValues={RW01, 768221109, , }} " +
+		kv.TxnRetryableMark
+	c.Assert(newWriteConflictError(conflict).Error(), Equals, expectedStr)
 }

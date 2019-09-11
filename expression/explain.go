@@ -16,15 +16,18 @@ package expression
 import (
 	"bytes"
 	"fmt"
+	"sort"
 
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
 )
 
 // ExplainInfo implements the Expression interface.
 func (expr *ScalarFunction) ExplainInfo() string {
-	buffer := bytes.NewBufferString(fmt.Sprintf("%s(", expr.FuncName.L))
+	var buffer bytes.Buffer
+	fmt.Fprintf(&buffer, "%s(", expr.FuncName.L)
 	for i, arg := range expr.GetArgs() {
-		buffer.WriteString(fmt.Sprintf("%s", arg.ExplainInfo()))
+		buffer.WriteString(arg.ExplainInfo())
 		if i+1 < len(expr.GetArgs()) {
 			buffer.WriteString(", ")
 		}
@@ -40,31 +43,22 @@ func (expr *Column) ExplainInfo() string {
 
 // ExplainInfo implements the Expression interface.
 func (expr *Constant) ExplainInfo() string {
-	valStr, err := expr.Value.ToString()
+	dt, err := expr.Eval(chunk.Row{})
 	if err != nil {
-		if expr.Value.Kind() == types.KindNull {
-			valStr = "null"
-		} else {
-			valStr = "not recognized const value"
-		}
+		return "not recognized const vanue"
 	}
-	return valStr
+	return expr.format(dt)
 }
 
-// ExplainAggFunc generates explain information for a aggregation function.
-func ExplainAggFunc(agg AggregationFunction) string {
-	buffer := bytes.NewBufferString(fmt.Sprintf("%s(", agg.GetName()))
-	if agg.IsDistinct() {
-		buffer.WriteString("distinct ")
+func (expr *Constant) format(dt types.Datum) string {
+	switch dt.Kind() {
+	case types.KindNull:
+		return "NULL"
+	case types.KindString, types.KindBytes, types.KindMysqlEnum, types.KindMysqlSet,
+		types.KindMysqlJSON, types.KindBinaryLiteral, types.KindMysqlBit:
+		return fmt.Sprintf("\"%v\"", dt.GetValue())
 	}
-	for i, arg := range agg.GetArgs() {
-		buffer.WriteString(arg.ExplainInfo())
-		if i+1 < len(agg.GetArgs()) {
-			buffer.WriteString(", ")
-		}
-	}
-	buffer.WriteString(")")
-	return buffer.String()
+	return fmt.Sprintf("%v", dt.GetValue())
 }
 
 // ExplainExpressionList generates explain information for a list of expressions.
@@ -73,6 +67,25 @@ func ExplainExpressionList(exprs []Expression) []byte {
 	for i, expr := range exprs {
 		buffer.WriteString(expr.ExplainInfo())
 		if i+1 < len(exprs) {
+			buffer.WriteString(", ")
+		}
+	}
+	return buffer.Bytes()
+}
+
+// SortedExplainExpressionList generates explain information for a list of expressions in order.
+// In some scenarios, the expr's order may not be stable when executing multiple times.
+// So we add a sort to make its explain result stable.
+func SortedExplainExpressionList(exprs []Expression) []byte {
+	buffer := bytes.NewBufferString("")
+	exprInfos := make([]string, 0, len(exprs))
+	for _, expr := range exprs {
+		exprInfos = append(exprInfos, expr.ExplainInfo())
+	}
+	sort.Strings(exprInfos)
+	for i, info := range exprInfos {
+		buffer.WriteString(info)
+		if i+1 < len(exprInfos) {
 			buffer.WriteString(", ")
 		}
 	}

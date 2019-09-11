@@ -14,11 +14,12 @@
 package stringutil
 
 import (
-	"bytes"
+	"fmt"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/util/hack"
 )
 
 // ErrSyntax indicates that a value does not have the right syntax for the target type.
@@ -161,7 +162,12 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 				}
 			}
 		case '_':
-			lastAny = false
+			if lastAny {
+				patChars[patLen-1], patTypes[patLen-1] = c, patOne
+				patChars[patLen], patTypes[patLen] = '%', patAny
+				patLen++
+				continue
+			}
 			tp = patOne
 		case '%':
 			if lastAny {
@@ -177,12 +183,6 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 		patTypes[patLen] = tp
 		patLen++
 	}
-	for i := 0; i < patLen-1; i++ {
-		if (patTypes[i] == patAny) && (patTypes[i+1] == patOne) {
-			patTypes[i] = patOne
-			patTypes[i+1] = patAny
-		}
-	}
 	patChars = patChars[:patLen]
 	patTypes = patTypes[:patLen]
 	return
@@ -190,14 +190,19 @@ func CompilePattern(pattern string, escape byte) (patChars, patTypes []byte) {
 
 const caseDiff = 'a' - 'A'
 
+// NOTE: Currently tikv's like function is case sensitive, so we keep its behavior here.
 func matchByteCI(a, b byte) bool {
-	if a == b {
-		return true
-	}
-	if a >= 'a' && a <= 'z' && a-caseDiff == b {
-		return true
-	}
-	return a >= 'A' && a <= 'Z' && a+caseDiff == b
+	return a == b
+	// We may reuse below code block when like function go back to case insensitive.
+	/*
+		if a == b {
+			return true
+		}
+		if a >= 'a' && a <= 'z' && a-caseDiff == b {
+			return true
+		}
+		return a >= 'A' && a <= 'Z' && a+caseDiff == b
+	*/
 }
 
 // DoMatch matches the string with patChars and patTypes.
@@ -232,16 +237,41 @@ func DoMatch(str string, patChars, patTypes []byte) bool {
 	return sIdx == len(str)
 }
 
-// RemoveBlanks removes all blanks, returns a new string.
-func RemoveBlanks(s string) string {
-	var buf = new(bytes.Buffer)
-	var cbuf [6]byte
-	for _, c := range s {
-		if c == rune(' ') || c == rune('\t') || c == rune('\r') || c == rune('\n') {
-			continue
+// IsExactMatch return true if no wildcard character
+func IsExactMatch(patTypes []byte) bool {
+	for _, pt := range patTypes {
+		if pt != patMatch {
+			return false
 		}
-		len := utf8.EncodeRune(cbuf[0:], c)
-		buf.Write(cbuf[0:len])
 	}
-	return buf.String()
+	return true
+}
+
+// Copy deep copies a string.
+func Copy(src string) string {
+	return string(hack.Slice(src))
+}
+
+// stringerFunc defines string func implement fmt.Stringer.
+type stringerFunc func() string
+
+// String implements fmt.Stringer
+func (l stringerFunc) String() string {
+	return l()
+}
+
+// MemoizeStr returns memoized version of stringFunc.
+func MemoizeStr(l func() string) fmt.Stringer {
+	return stringerFunc(func() string {
+		return l()
+	})
+}
+
+// StringerStr defines a alias to normal string.
+// implement fmt.Stringer
+type StringerStr string
+
+// String implements fmt.Stringer
+func (i StringerStr) String() string {
+	return string(i)
 }

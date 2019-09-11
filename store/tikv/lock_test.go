@@ -14,6 +14,8 @@
 package tikv
 
 import (
+	"bytes"
+	"context"
 	"math"
 	"runtime"
 	"time"
@@ -22,17 +24,17 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
-	goctx "golang.org/x/net/context"
 )
 
 type testLockSuite struct {
+	OneByOneSuite
 	store *tikvStore
 }
 
 var _ = Suite(&testLockSuite{})
 
 func (s *testLockSuite) SetUpTest(c *C) {
-	s.store = newTestStore(c)
+	s.store = NewTestStore(c).(*tikvStore)
 }
 
 func (s *testLockSuite) TearDownTest(c *C) {
@@ -54,18 +56,22 @@ func (s *testLockSuite) lockKey(c *C, key, value, primaryKey, primaryValue []byt
 		err = txn.Delete(primaryKey)
 	}
 	c.Assert(err, IsNil)
-	tpc, err := newTwoPhaseCommitter(txn)
+	tpc, err := newTwoPhaseCommitterWithInit(txn, 0)
 	c.Assert(err, IsNil)
-	tpc.keys = [][]byte{primaryKey, key}
+	if bytes.Equal(key, primaryKey) {
+		tpc.keys = [][]byte{primaryKey}
+	} else {
+		tpc.keys = [][]byte{primaryKey, key}
+	}
 
-	ctx := goctx.Background()
-	err = tpc.prewriteKeys(NewBackoffer(prewriteMaxBackoff, ctx), tpc.keys)
+	ctx := context.Background()
+	err = tpc.prewriteKeys(NewBackoffer(ctx, prewriteMaxBackoff), tpc.keys)
 	c.Assert(err, IsNil)
 
 	if commitPrimary {
 		tpc.commitTS, err = s.store.oracle.GetTimestamp(ctx)
 		c.Assert(err, IsNil)
-		err = tpc.commitKeys(NewBackoffer(commitMaxBackoff, ctx), [][]byte{primaryKey})
+		err = tpc.commitKeys(NewBackoffer(ctx, CommitMaxBackoff), [][]byte{primaryKey})
 		c.Assert(err, IsNil)
 	}
 	return txn.startTS, tpc.commitTS
@@ -82,7 +88,7 @@ func (s *testLockSuite) putKV(c *C, key, value []byte) (uint64, uint64) {
 	c.Assert(err, IsNil)
 	err = txn.Set(key, value)
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 	return txn.StartTS(), txn.(*tikvTxn).commitTS
 }
@@ -103,7 +109,7 @@ func (s *testLockSuite) TestScanLockResolveWithGet(c *C) {
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
 	for ch := byte('a'); ch <= byte('z'); ch++ {
-		v, err := txn.Get([]byte{ch})
+		v, err := txn.Get(context.TODO(), []byte{ch})
 		c.Assert(err, IsNil)
 		c.Assert(v, BytesEquals, []byte{ch})
 	}
@@ -115,12 +121,28 @@ func (s *testLockSuite) TestScanLockResolveWithSeek(c *C) {
 
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
-	iter, err := txn.Seek([]byte("a"))
+	iter, err := txn.Iter([]byte("a"), nil)
 	c.Assert(err, IsNil)
 	for ch := byte('a'); ch <= byte('z'); ch++ {
 		c.Assert(iter.Valid(), IsTrue)
 		c.Assert([]byte(iter.Key()), BytesEquals, []byte{ch})
 		c.Assert([]byte(iter.Value()), BytesEquals, []byte{ch})
+		c.Assert(iter.Next(), IsNil)
+	}
+}
+
+func (s *testLockSuite) TestScanLockResolveWithSeekKeyOnly(c *C) {
+	s.putAlphabets(c)
+	s.prepareAlphabetLocks(c)
+
+	txn, err := s.store.Begin()
+	c.Assert(err, IsNil)
+	txn.SetOption(kv.KeyOnly, true)
+	iter, err := txn.Iter([]byte("a"), nil)
+	c.Assert(err, IsNil)
+	for ch := byte('a'); ch <= byte('z'); ch++ {
+		c.Assert(iter.Valid(), IsTrue)
+		c.Assert([]byte(iter.Key()), BytesEquals, []byte{ch})
 		c.Assert(iter.Next(), IsNil)
 	}
 }
@@ -136,8 +158,9 @@ func (s *testLockSuite) TestScanLockResolveWithBatchGet(c *C) {
 
 	ver, err := s.store.CurrentVersion()
 	c.Assert(err, IsNil)
-	snapshot := newTiKVSnapshot(s.store, ver)
-	m, err := snapshot.BatchGet(keys)
+	snapshot := newTiKVSnapshot(s.store, ver, 0)
+	m, err := snapshot.BatchGet(context.Background(), keys)
+	c.Assert(err, IsNil)
 	c.Assert(len(m), Equals, int('z'-'a'+1))
 	for ch := byte('a'); ch <= byte('z'); ch++ {
 		k := []byte{ch}
@@ -156,7 +179,7 @@ func (s *testLockSuite) TestCleanLock(c *C) {
 		err = txn.Set([]byte{ch}, []byte{ch + 1})
 		c.Assert(err, IsNil)
 	}
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 }
 
@@ -179,47 +202,53 @@ func (s *testLockSuite) TestGetTxnStatus(c *C) {
 	c.Assert(status.IsCommitted(), IsFalse)
 }
 
-func (s *testLockSuite) TestRC(c *C) {
-	s.putKV(c, []byte("key"), []byte("v1"))
-
+func (s *testLockSuite) TestTxnHeartBeat(c *C) {
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
-	txn.Set([]byte("key"), []byte("v2"))
+	txn.Set(kv.Key("key"), []byte("value"))
 	s.prewriteTxn(c, txn.(*tikvTxn))
 
-	txn2, err := s.store.Begin()
+	bo := NewBackoffer(context.Background(), prewriteMaxBackoff)
+	newTTL, err := sendTxnHeartBeat(bo, s.store, []byte("key"), txn.StartTS(), 666)
 	c.Assert(err, IsNil)
-	txn2.SetOption(kv.IsolationLevel, kv.RC)
-	val, err := txn2.Get([]byte("key"))
+	c.Assert(newTTL, Equals, uint64(666))
+
+	newTTL, err = sendTxnHeartBeat(bo, s.store, []byte("key"), txn.StartTS(), 555)
 	c.Assert(err, IsNil)
-	c.Assert(string(val), Equals, "v1")
+	c.Assert(newTTL, Equals, uint64(666))
+
+	// The getTxnStatus API is confusing, it really means rollback!
+	status, err := newLockResolver(s.store).getTxnStatus(bo, txn.StartTS(), []byte("key"))
+	c.Assert(err, IsNil)
+	c.Assert(status.ttl, Equals, uint64(0))
+	c.Assert(status.commitTS, Equals, uint64(0))
+
+	newTTL, err = sendTxnHeartBeat(bo, s.store, []byte("key"), txn.StartTS(), 666)
+	c.Assert(err, NotNil)
+	c.Assert(newTTL, Equals, uint64(0))
 }
 
 func (s *testLockSuite) prewriteTxn(c *C, txn *tikvTxn) {
-	committer, err := newTwoPhaseCommitter(txn)
+	committer, err := newTwoPhaseCommitterWithInit(txn, 0)
 	c.Assert(err, IsNil)
-	err = committer.prewriteKeys(NewBackoffer(prewriteMaxBackoff, goctx.Background()), committer.keys)
+	err = committer.prewriteKeys(NewBackoffer(context.Background(), prewriteMaxBackoff), committer.keys)
 	c.Assert(err, IsNil)
 }
 
 func (s *testLockSuite) mustGetLock(c *C, key []byte) *Lock {
 	ver, err := s.store.CurrentVersion()
 	c.Assert(err, IsNil)
-	bo := NewBackoffer(getMaxBackoff, goctx.Background())
-	req := &tikvrpc.Request{
-		Type: tikvrpc.CmdGet,
-		Get: &kvrpcpb.GetRequest{
-			Key:     key,
-			Version: ver.Ver,
-		},
-	}
+	bo := NewBackoffer(context.Background(), getMaxBackoff)
+	req := tikvrpc.NewRequest(tikvrpc.CmdGet, &kvrpcpb.GetRequest{
+		Key:     key,
+		Version: ver.Ver,
+	})
 	loc, err := s.store.regionCache.LocateKey(bo, key)
 	c.Assert(err, IsNil)
 	resp, err := s.store.SendReq(bo, req, loc.Region, readTimeoutShort)
 	c.Assert(err, IsNil)
-	cmdGetResp := resp.Get
-	c.Assert(cmdGetResp, NotNil)
-	keyErr := cmdGetResp.GetError()
+	c.Assert(resp.Resp, NotNil)
+	keyErr := resp.Resp.(*kvrpcpb.GetResponse).GetError()
 	c.Assert(keyErr, NotNil)
 	lock, err := extractLockFromKeyErr(keyErr)
 	c.Assert(err, IsNil)
@@ -268,6 +297,11 @@ func (s *testLockSuite) TestLockTTL(c *C) {
 	s.prewriteTxn(c, txn.(*tikvTxn))
 	l = s.mustGetLock(c, []byte("key"))
 	s.ttlEquals(c, l.TTL, defaultLockTTL+uint64(time.Since(start)/time.Millisecond))
+}
+
+func (s *testLockSuite) TestNewLockZeroTTL(c *C) {
+	l := NewLock(&kvrpcpb.LockInfo{})
+	c.Assert(l.TTL, Equals, uint64(0))
 }
 
 func init() {

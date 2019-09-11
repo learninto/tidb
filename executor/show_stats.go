@@ -16,50 +16,60 @@ package executor
 import (
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	"github.com/pingcap/tidb/util/codec"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 func (e *ShowExec) fetchShowStatsMeta() error {
-	do := sessionctx.GetDomain(e.ctx)
+	do := domain.GetDomain(e.ctx)
 	h := do.StatsHandle()
 	dbs := do.InfoSchema().AllSchemas()
 	for _, db := range dbs {
 		for _, tbl := range db.Tables {
-			statsTbl := h.GetTableStats(tbl.ID)
-			if !statsTbl.Pseudo {
-				row := types.MakeDatums(
-					db.Name.O,
-					tbl.Name.O,
-					e.versionToTime(statsTbl.Version),
-					statsTbl.ModifyCount,
-					statsTbl.Count,
-				)
-				e.rows = append(e.rows, row)
+			pi := tbl.GetPartitionInfo()
+			if pi == nil {
+				e.appendTableForStatsMeta(db.Name.O, tbl.Name.O, "", h.GetTableStats(tbl))
+			} else {
+				for _, def := range pi.Definitions {
+					e.appendTableForStatsMeta(db.Name.O, tbl.Name.O, def.Name.O, h.GetPartitionStats(tbl, def.ID))
+				}
 			}
 		}
 	}
 	return nil
+}
+
+func (e *ShowExec) appendTableForStatsMeta(dbName, tblName, partitionName string, statsTbl *statistics.Table) {
+	if statsTbl.Pseudo {
+		return
+	}
+	e.appendRow([]interface{}{
+		dbName,
+		tblName,
+		partitionName,
+		e.versionToTime(statsTbl.Version),
+		statsTbl.ModifyCount,
+		statsTbl.Count,
+	})
 }
 
 func (e *ShowExec) fetchShowStatsHistogram() error {
-	do := sessionctx.GetDomain(e.ctx)
+	do := domain.GetDomain(e.ctx)
 	h := do.StatsHandle()
 	dbs := do.InfoSchema().AllSchemas()
 	for _, db := range dbs {
 		for _, tbl := range db.Tables {
-			statsTbl := h.GetTableStats(tbl.ID)
-			if !statsTbl.Pseudo {
-				for _, col := range statsTbl.Columns {
-					e.rows = append(e.rows, e.histogramToRow(db.Name.O, tbl.Name.O, col.Info.Name.O, 0, col.Histogram))
-				}
-				for _, idx := range statsTbl.Indices {
-					e.rows = append(e.rows, e.histogramToRow(db.Name.O, tbl.Name.O, idx.Info.Name.O, 1, idx.Histogram))
+			pi := tbl.GetPartitionInfo()
+			if pi == nil {
+				e.appendTableForStatsHistograms(db.Name.O, tbl.Name.O, "", h.GetTableStats(tbl))
+			} else {
+				for _, def := range pi.Definitions {
+					e.appendTableForStatsHistograms(db.Name.O, tbl.Name.O, def.Name.O, h.GetPartitionStats(tbl, def.ID))
 				}
 			}
 		}
@@ -67,16 +77,35 @@ func (e *ShowExec) fetchShowStatsHistogram() error {
 	return nil
 }
 
-func (e *ShowExec) histogramToRow(dbName string, tblName string, colName string, isIndex int, hist statistics.Histogram) Row {
-	return types.MakeDatums(
+func (e *ShowExec) appendTableForStatsHistograms(dbName, tblName, partitionName string, statsTbl *statistics.Table) {
+	if statsTbl.Pseudo {
+		return
+	}
+	for _, col := range statsTbl.Columns {
+		// Pass a nil StatementContext to avoid column stats being marked as needed.
+		if col.IsInvalid(nil, false) {
+			continue
+		}
+		e.histogramToRow(dbName, tblName, partitionName, col.Info.Name.O, 0, col.Histogram, col.AvgColSize(statsTbl.Count, false))
+	}
+	for _, idx := range statsTbl.Indices {
+		e.histogramToRow(dbName, tblName, partitionName, idx.Info.Name.O, 1, idx.Histogram, 0)
+	}
+}
+
+func (e *ShowExec) histogramToRow(dbName, tblName, partitionName, colName string, isIndex int, hist statistics.Histogram, avgColSize float64) {
+	e.appendRow([]interface{}{
 		dbName,
 		tblName,
+		partitionName,
 		colName,
 		isIndex,
 		e.versionToTime(hist.LastUpdateVersion),
 		hist.NDV,
 		hist.NullCount,
-	)
+		avgColSize,
+		hist.Correlation,
+	})
 }
 
 func (e *ShowExec) versionToTime(version uint64) types.Time {
@@ -85,26 +114,21 @@ func (e *ShowExec) versionToTime(version uint64) types.Time {
 }
 
 func (e *ShowExec) fetchShowStatsBuckets() error {
-	do := sessionctx.GetDomain(e.ctx)
+	do := domain.GetDomain(e.ctx)
 	h := do.StatsHandle()
 	dbs := do.InfoSchema().AllSchemas()
 	for _, db := range dbs {
 		for _, tbl := range db.Tables {
-			statsTbl := h.GetTableStats(tbl.ID)
-			if !statsTbl.Pseudo {
-				for _, col := range statsTbl.Columns {
-					rows, err := e.bucketsToRows(db.Name.O, tbl.Name.O, col.Info.Name.O, 0, col.Histogram)
-					if err != nil {
-						return errors.Trace(err)
-					}
-					e.rows = append(e.rows, rows...)
+			pi := tbl.GetPartitionInfo()
+			if pi == nil {
+				if err := e.appendTableForStatsBuckets(db.Name.O, tbl.Name.O, "", h.GetTableStats(tbl)); err != nil {
+					return err
 				}
-				for _, idx := range statsTbl.Indices {
-					rows, err := e.bucketsToRows(db.Name.O, tbl.Name.O, idx.Info.Name.O, len(idx.Info.Columns), idx.Histogram)
-					if err != nil {
-						return errors.Trace(err)
+			} else {
+				for _, def := range pi.Definitions {
+					if err := e.appendTableForStatsBuckets(db.Name.O, tbl.Name.O, def.Name.O, h.GetPartitionStats(tbl, def.ID)); err != nil {
+						return err
 					}
-					e.rows = append(e.rows, rows...)
 				}
 			}
 		}
@@ -112,52 +136,98 @@ func (e *ShowExec) fetchShowStatsBuckets() error {
 	return nil
 }
 
+func (e *ShowExec) appendTableForStatsBuckets(dbName, tblName, partitionName string, statsTbl *statistics.Table) error {
+	if statsTbl.Pseudo {
+		return nil
+	}
+	for _, col := range statsTbl.Columns {
+		err := e.bucketsToRows(dbName, tblName, partitionName, col.Info.Name.O, 0, col.Histogram)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	for _, idx := range statsTbl.Indices {
+		err := e.bucketsToRows(dbName, tblName, partitionName, idx.Info.Name.O, len(idx.Info.Columns), idx.Histogram)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
+}
+
 // bucketsToRows converts histogram buckets to rows. If the histogram is built from index, then numOfCols equals to number
 // of index columns, else numOfCols is 0.
-func (e *ShowExec) bucketsToRows(dbName, tblName, colName string, numOfCols int, hist statistics.Histogram) ([]Row, error) {
+func (e *ShowExec) bucketsToRows(dbName, tblName, partitionName, colName string, numOfCols int, hist statistics.Histogram) error {
 	isIndex := 0
 	if numOfCols > 0 {
 		isIndex = 1
 	}
-	var rows []Row
-	for i, bkt := range hist.Buckets {
-		lowerBoundStr, err := e.valueToString(bkt.LowerBound, numOfCols)
+	for i := 0; i < hist.Len(); i++ {
+		lowerBoundStr, err := statistics.ValueToString(hist.GetLower(i), numOfCols)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
-		upperBoundStr, err := e.valueToString(bkt.UpperBound, numOfCols)
+		upperBoundStr, err := statistics.ValueToString(hist.GetUpper(i), numOfCols)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return errors.Trace(err)
 		}
-		row := types.MakeDatums(
+		e.appendRow([]interface{}{
 			dbName,
 			tblName,
+			partitionName,
 			colName,
 			isIndex,
 			i,
-			bkt.Count,
-			bkt.Repeats,
+			hist.Buckets[i].Count,
+			hist.Buckets[i].Repeat,
 			lowerBoundStr,
 			upperBoundStr,
-		)
-		rows = append(rows, row)
+		})
 	}
-	return rows, nil
+	return nil
 }
 
-// valueToString converts a possible encoded value to a formatted string. If the value is encoded, then
-// size equals to number of origin values, else size is 0.
-func (e *ShowExec) valueToString(value types.Datum, size int) (string, error) {
-	if size == 0 {
-		return value.ToString()
+func (e *ShowExec) fetchShowStatsHealthy() {
+	do := domain.GetDomain(e.ctx)
+	h := do.StatsHandle()
+	dbs := do.InfoSchema().AllSchemas()
+	for _, db := range dbs {
+		for _, tbl := range db.Tables {
+			pi := tbl.GetPartitionInfo()
+			if pi == nil {
+				e.appendTableForStatsHealthy(db.Name.O, tbl.Name.O, "", h.GetTableStats(tbl))
+			} else {
+				for _, def := range pi.Definitions {
+					e.appendTableForStatsHealthy(db.Name.O, tbl.Name.O, def.Name.O, h.GetPartitionStats(tbl, def.ID))
+				}
+			}
+		}
 	}
-	decodedVals, err := codec.Decode(value.GetBytes(), size)
-	if err != nil {
-		return "", errors.Trace(err)
+}
+
+func (e *ShowExec) appendTableForStatsHealthy(dbName, tblName, partitionName string, statsTbl *statistics.Table) {
+	if statsTbl.Pseudo {
+		return
 	}
-	str, err := types.DatumsToString(decodedVals)
-	if err != nil {
-		return "", errors.Trace(err)
+	var healthy int64
+	if statsTbl.ModifyCount < statsTbl.Count {
+		healthy = int64((1.0 - float64(statsTbl.ModifyCount)/float64(statsTbl.Count)) * 100.0)
+	} else if statsTbl.ModifyCount == 0 {
+		healthy = 100
 	}
-	return str, nil
+	e.appendRow([]interface{}{
+		dbName,
+		tblName,
+		partitionName,
+		healthy,
+	})
+}
+
+func (e *ShowExec) fetchShowAnalyzeStatus() {
+	rows := infoschema.DataForAnalyzeStatus()
+	for _, row := range rows {
+		for i, val := range row {
+			e.result.AppendDatum(i, &val)
+		}
+	}
 }

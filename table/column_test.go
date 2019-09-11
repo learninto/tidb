@@ -17,12 +17,14 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
@@ -30,7 +32,7 @@ func TestT(t *testing.T) {
 	TestingT(t)
 }
 
-func (s *testTableSuite) TestString(c *C) {
+func (t *testTableSuite) TestString(c *C) {
 	defer testleak.AfterTest(c)()
 	col := ToColumn(&model.ColumnInfo{
 		FieldType: *types.NewFieldType(mysql.TypeTiny),
@@ -42,7 +44,7 @@ func (s *testTableSuite) TestString(c *C) {
 	col.Collate = mysql.DefaultCollationName
 	col.Flag |= mysql.ZerofillFlag | mysql.UnsignedFlag | mysql.BinaryFlag | mysql.AutoIncrementFlag | mysql.NotNullFlag
 
-	c.Assert(col.GetTypeDesc(), Equals, "tinyint(2,1) UNSIGNED")
+	c.Assert(col.GetTypeDesc(), Equals, "tinyint(2) unsigned zerofill")
 	col.ToInfo()
 	tbInfo := &model.TableInfo{}
 	c.Assert(col.IsPKHandleColumn(tbInfo), Equals, false)
@@ -81,20 +83,20 @@ func (s *testTableSuite) TestString(c *C) {
 	c.Assert(col.GetTypeDesc(), Equals, "datetime")
 }
 
-func (s *testTableSuite) TestFind(c *C) {
+func (t *testTableSuite) TestFind(c *C) {
 	defer testleak.AfterTest(c)()
 	cols := []*Column{
 		newCol("a"),
 		newCol("b"),
 		newCol("c"),
 	}
-	FindCols(cols, []string{"a"})
-	FindCols(cols, []string{"d"})
+	FindCols(cols, []string{"a"}, true)
+	FindCols(cols, []string{"d"}, true)
 	cols[0].Flag |= mysql.OnUpdateNowFlag
 	FindOnUpdateCols(cols)
 }
 
-func (s *testTableSuite) TestCheck(c *C) {
+func (t *testTableSuite) TestCheck(c *C) {
 	defer testleak.AfterTest(c)()
 	col := newCol("a")
 	col.Flag = mysql.AutoIncrementFlag
@@ -107,7 +109,25 @@ func (s *testTableSuite) TestCheck(c *C) {
 	CheckOnce([]*Column{})
 }
 
-func (s *testTableSuite) TestDesc(c *C) {
+func (t *testTableSuite) TestHandleBadNull(c *C) {
+	col := newCol("a")
+	sc := new(stmtctx.StatementContext)
+	d, err := col.HandleBadNull(types.Datum{}, sc)
+	c.Assert(err, IsNil)
+	cmp, err := d.CompareDatum(sc, &types.Datum{})
+	c.Assert(err, IsNil)
+	c.Assert(cmp, Equals, 0)
+
+	col.Flag |= mysql.NotNullFlag
+	d, err = col.HandleBadNull(types.Datum{}, sc)
+	c.Assert(err, NotNil)
+
+	sc.BadNullAsWarning = true
+	d, err = col.HandleBadNull(types.Datum{}, sc)
+	c.Assert(err, IsNil)
+}
+
+func (t *testTableSuite) TestDesc(c *C) {
 	defer testleak.AfterTest(c)()
 	col := newCol("a")
 	col.Flag = mysql.AutoIncrementFlag | mysql.NotNullFlag | mysql.PriKeyFlag
@@ -116,7 +136,7 @@ func (s *testTableSuite) TestDesc(c *C) {
 	NewColDesc(col)
 	col.Flag = mysql.UniqueKeyFlag | mysql.OnUpdateNowFlag
 	desc := NewColDesc(col)
-	c.Assert(desc.Extra, Equals, "on update CURRENT_TIMESTAMP")
+	c.Assert(desc.Extra, Equals, "DEFAULT_GENERATED on update CURRENT_TIMESTAMP")
 	col.Flag = 0
 	col.GeneratedExprString = "test"
 	col.GeneratedStored = true
@@ -129,7 +149,7 @@ func (s *testTableSuite) TestDesc(c *C) {
 	ColDescFieldNames(true)
 }
 
-func (s *testTableSuite) TestGetZeroValue(c *C) {
+func (t *testTableSuite) TestGetZeroValue(c *C) {
 	tests := []struct {
 		ft    *types.FieldType
 		value types.Datum
@@ -183,7 +203,7 @@ func (s *testTableSuite) TestGetZeroValue(c *C) {
 		},
 		{
 			types.NewFieldType(mysql.TypeBit),
-			types.NewDatum(types.Bit{Value: 0, Width: types.MinBitWidth}),
+			types.NewMysqlBitDatum(types.ZeroBinaryLiteral),
 		},
 		{
 			types.NewFieldType(mysql.TypeSet),
@@ -193,19 +213,41 @@ func (s *testTableSuite) TestGetZeroValue(c *C) {
 			types.NewFieldType(mysql.TypeEnum),
 			types.NewDatum(types.Enum{}),
 		},
+		{
+			&types.FieldType{
+				Tp:      mysql.TypeString,
+				Flen:    2,
+				Charset: charset.CharsetBin,
+				Collate: charset.CollationBin,
+			},
+			types.NewDatum(make([]byte, 2)),
+		},
+		{
+			&types.FieldType{
+				Tp:      mysql.TypeString,
+				Flen:    2,
+				Charset: charset.CharsetUTF8MB4,
+				Collate: charset.CollationBin,
+			},
+			types.NewDatum(""),
+		},
+		{
+			types.NewFieldType(mysql.TypeJSON),
+			types.NewDatum(json.CreateBinary(nil)),
+		},
 	}
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	for _, tt := range tests {
 		colInfo := &model.ColumnInfo{FieldType: *tt.ft}
 		zv := GetZeroValue(colInfo)
 		c.Assert(zv.Kind(), Equals, tt.value.Kind())
-		cmp, err := zv.CompareDatum(sc, tt.value)
+		cmp, err := zv.CompareDatum(sc, &tt.value)
 		c.Assert(err, IsNil)
 		c.Assert(cmp, Equals, 0)
 	}
 }
 
-func (s *testTableSuite) TestCastValue(c *C) {
+func (t *testTableSuite) TestCastValue(c *C) {
 	ctx := mock.NewContext()
 	colInfo := model.ColumnInfo{
 		FieldType: *types.NewFieldType(mysql.TypeLong),
@@ -225,10 +267,12 @@ func (s *testTableSuite) TestCastValue(c *C) {
 		State:     model.StatePublic,
 	})
 
-	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col}, false)
+	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col})
 	c.Assert(err, NotNil)
-	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col}, true)
+	ctx.GetSessionVars().StmtCtx.DupKeyAsWarning = true
+	err = CastValues(ctx, []types.Datum{types.NewDatum("test")}, []*Column{col})
 	c.Assert(err, IsNil)
+	ctx.GetSessionVars().StmtCtx.DupKeyAsWarning = false
 
 	colInfoS := model.ColumnInfo{
 		FieldType: *types.NewFieldType(mysql.TypeString),
@@ -237,12 +281,23 @@ func (s *testTableSuite) TestCastValue(c *C) {
 	val, err = CastValue(ctx, types.NewDatum("test"), &colInfoS)
 	c.Assert(err, IsNil)
 	c.Assert(val, NotNil)
+
+	colInfoS.Charset = mysql.UTF8Charset
+	_, err = CastValue(ctx, types.NewDatum([]byte{0xf0, 0x9f, 0x8c, 0x80}), &colInfoS)
+	c.Assert(err, NotNil)
+
+	colInfoS.Charset = mysql.UTF8MB4Charset
+	_, err = CastValue(ctx, types.NewDatum([]byte{0xf0, 0x9f, 0x80}), &colInfoS)
+	c.Assert(err, NotNil)
 }
 
-func (s *testTableSuite) TestGetDefaultValue(c *C) {
+func (t *testTableSuite) TestGetDefaultValue(c *C) {
 	ctx := mock.NewContext()
 	zeroTimestamp := types.ZeroTimestamp
-	zeroTimestamp.TimeZone = ctx.GetSessionVars().GetTimeZone()
+	timestampValue := types.Time{
+		Time: types.FromDate(2019, 5, 6, 12, 48, 49, 0),
+		Type: mysql.TypeTimestamp,
+	}
 	tests := []struct {
 		colInfo *model.ColumnInfo
 		strict  bool
@@ -292,7 +347,7 @@ func (s *testTableSuite) TestGetDefaultValue(c *C) {
 				},
 			},
 			false,
-			types.NewStringDatum("abc"),
+			types.NewMysqlEnumDatum(types.Enum{Name: "abc", Value: 1}),
 			nil,
 		},
 		{
@@ -311,13 +366,39 @@ func (s *testTableSuite) TestGetDefaultValue(c *C) {
 		{
 			&model.ColumnInfo{
 				FieldType: types.FieldType{
+					Tp:   mysql.TypeTimestamp,
+					Flag: mysql.TimestampFlag,
+				},
+				OriginDefaultValue: timestampValue.String(),
+				DefaultValue:       timestampValue.String(),
+			},
+			true,
+			types.NewDatum(timestampValue),
+			nil,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
+					Tp:   mysql.TypeTimestamp,
+					Flag: mysql.TimestampFlag,
+				},
+				OriginDefaultValue: "not valid date",
+				DefaultValue:       "not valid date",
+			},
+			true,
+			types.NewDatum(zeroTimestamp),
+			errGetDefaultFailed,
+		},
+		{
+			&model.ColumnInfo{
+				FieldType: types.FieldType{
 					Tp:   mysql.TypeLonglong,
 					Flag: mysql.NotNullFlag,
 				},
 			},
 			true,
 			types.NewDatum(zeroTimestamp),
-			errNoDefaultValue,
+			ErrNoDefaultValue,
 		},
 		{
 			&model.ColumnInfo{
@@ -327,13 +408,13 @@ func (s *testTableSuite) TestGetDefaultValue(c *C) {
 				},
 			},
 			true,
-			types.Datum{},
+			types.NewIntDatum(0),
 			nil,
 		},
 	}
 
 	for _, tt := range tests {
-		ctx.GetSessionVars().StrictSQLMode = tt.strict
+		ctx.GetSessionVars().StmtCtx.BadNullAsWarning = !tt.strict
 		val, err := GetColDefaultValue(ctx, tt.colInfo)
 		if err != nil {
 			c.Assert(tt.err, NotNil, Commentf("%v", err))
@@ -343,7 +424,7 @@ func (s *testTableSuite) TestGetDefaultValue(c *C) {
 	}
 
 	for _, tt := range tests {
-		ctx.GetSessionVars().StrictSQLMode = tt.strict
+		ctx.GetSessionVars().StmtCtx.BadNullAsWarning = !tt.strict
 		val, err := GetColOriginDefaultValue(ctx, tt.colInfo)
 		if err != nil {
 			c.Assert(tt.err, NotNil, Commentf("%v", err))
@@ -351,7 +432,6 @@ func (s *testTableSuite) TestGetDefaultValue(c *C) {
 		}
 		c.Assert(val, DeepEquals, tt.val)
 	}
-
 }
 
 func newCol(name string) *Column {

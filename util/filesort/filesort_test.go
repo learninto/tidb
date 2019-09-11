@@ -21,9 +21,9 @@ import (
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
@@ -54,7 +54,7 @@ func nextRow(r *rand.Rand, keySize int, valSize int) (key []types.Datum, val []t
 func (s *testFileSortSuite) TestLessThan(c *C) {
 	defer testleak.AfterTest(c)()
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 
 	d0 := types.NewDatum(0)
 	d1 := types.NewDatum(1)
@@ -109,13 +109,13 @@ func (s *testFileSortSuite) TestInMemory(c *C) {
 	seed := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(seed)
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	keySize := r.Intn(10) + 1 // random int in range [1, 10]
 	valSize := r.Intn(20) + 1 // random int in range [1, 20]
 	bufSize := 40             // hold up to 40 items per file
 	byDesc := make([]bool, keySize)
 	for i := range byDesc {
-		byDesc[i] = (r.Intn(2) == 0)
+		byDesc[i] = r.Intn(2) == 0
 	}
 
 	var (
@@ -159,13 +159,13 @@ func (s *testFileSortSuite) TestMultipleFiles(c *C) {
 	seed := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(seed)
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	keySize := r.Intn(10) + 1 // random int in range [1, 10]
 	valSize := r.Intn(20) + 1 // random int in range [1, 20]
 	bufSize := 40             // hold up to 40 items per file
 	byDesc := make([]bool, keySize)
 	for i := range byDesc {
-		byDesc[i] = (r.Intn(2) == 0)
+		byDesc[i] = r.Intn(2) == 0
 	}
 
 	var (
@@ -181,7 +181,25 @@ func (s *testFileSortSuite) TestMultipleFiles(c *C) {
 	c.Assert(err, IsNil)
 
 	fsBuilder := new(Builder)
-	fs, err = fsBuilder.SetSC(sc).SetSchema(keySize, valSize).SetBuf(bufSize).SetWorkers(1).SetDesc(byDesc).SetDir(tmpDir).Build()
+
+	// Test for basic function.
+	_, err = fsBuilder.Build()
+	c.Assert(err.Error(), Equals, "StatementContext is nil")
+	fsBuilder.SetSC(sc)
+	_, err = fsBuilder.Build()
+	c.Assert(err.Error(), Equals, "key size is not positive")
+	fsBuilder.SetDesc(byDesc)
+	_, err = fsBuilder.Build()
+	c.Assert(err.Error(), Equals, "mismatch in key size and byDesc slice")
+	fsBuilder.SetSchema(keySize, valSize)
+	_, err = fsBuilder.Build()
+	c.Assert(err.Error(), Equals, "buffer size is not positive")
+	fsBuilder.SetBuf(bufSize)
+	_, err = fsBuilder.Build()
+	c.Assert(err.Error(), Equals, "tmpDir does not exist")
+	fsBuilder.SetDir(tmpDir)
+
+	fs, err = fsBuilder.SetWorkers(1).Build()
 	c.Assert(err, IsNil)
 	defer fs.Close()
 
@@ -209,13 +227,13 @@ func (s *testFileSortSuite) TestMultipleWorkers(c *C) {
 	seed := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(seed)
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	keySize := r.Intn(10) + 1 // random int in range [1, 10]
 	valSize := r.Intn(20) + 1 // random int in range [1, 20]
 	bufSize := 40             // hold up to 40 items per file
 	byDesc := make([]bool, keySize)
 	for i := range byDesc {
-		byDesc[i] = (r.Intn(2) == 0)
+		byDesc[i] = r.Intn(2) == 0
 	}
 
 	var (
@@ -259,7 +277,7 @@ func (s *testFileSortSuite) TestClose(c *C) {
 	seed := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(seed)
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	keySize := 2
 	valSize := 2
 	bufSize := 40
@@ -338,7 +356,7 @@ func (s *testFileSortSuite) TestMismatchedUsage(c *C) {
 	seed := rand.NewSource(time.Now().UnixNano())
 	r := rand.New(seed)
 
-	sc := new(variable.StatementContext)
+	sc := new(stmtctx.StatementContext)
 	keySize := 2
 	valSize := 2
 	bufSize := 40

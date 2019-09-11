@@ -14,56 +14,64 @@
 package ddl
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
+	"sync"
+	"sync/atomic"
 
-	"github.com/juju/errors"
-	"github.com/ngaut/log"
-	"github.com/ngaut/pools"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/ddl/util"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/store/tikv/oracle"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/tablecodec"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/sqlexec"
+	"go.uber.org/zap"
 )
 
 const (
-	insertDeleteRangeSQL   = `INSERT IGNORE INTO mysql.gc_delete_range VALUES ("%d", "%d", "%s", "%s", "%d")`
-	loadDeleteRangeSQL     = `SELECT job_id, element_id, start_key, end_key FROM mysql.gc_delete_range WHERE ts < %v ORDER BY ts`
-	completeDeleteRangeSQL = `DELETE FROM mysql.gc_delete_range WHERE job_id = %d AND element_id = %d`
-	updateDeleteRangeSQL   = `UPDATE mysql.gc_delete_range SET start_key = "%s" WHERE job_id = %d AND element_id = %d AND start_key = "%s"`
+	insertDeleteRangeSQL = `INSERT IGNORE INTO mysql.gc_delete_range VALUES ("%d", "%d", "%s", "%s", "%d")`
 
-	delBatchSize int = 65536
-	delBackLog       = 128
+	delBatchSize = 65536
+	delBackLog   = 128
 )
+
+// enableEmulatorGC means whether to enable emulator GC. The default is enable.
+// In some unit tests, we want to stop emulator GC, then wen can set enableEmulatorGC to 0.
+var emulatorGCEnable = int32(1)
 
 type delRangeManager interface {
 	// addDelRangeJob add a DDL job into gc_delete_range table.
 	addDelRangeJob(job *model.Job) error
+	// removeFromGCDeleteRange removes the deleting table job from gc_delete_range table by jobID and tableID.
+	// It's use for recover the table that was mistakenly deleted.
+	removeFromGCDeleteRange(jobID, tableID int64) error
 	start()
 	clear()
 }
 
 type delRange struct {
-	d            *ddl
-	ctxPool      *pools.ResourcePool
+	store      kv.Storage
+	sessPool   *sessionPool
+	emulatorCh chan struct{}
+	keys       []kv.Key
+	quitCh     chan struct{}
+
+	wait         sync.WaitGroup // wait is only used when storeSupport is false.
 	storeSupport bool
-	emulatorCh   chan struct{}
-	keys         []kv.Key
 }
 
 // newDelRangeManager returns a delRangeManager.
-func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, supportDelRange bool) delRangeManager {
+func newDelRangeManager(store kv.Storage, sessPool *sessionPool) delRangeManager {
 	dr := &delRange{
-		d:            d,
-		ctxPool:      ctxPool,
-		storeSupport: supportDelRange,
+		store:        store,
+		sessPool:     sessPool,
+		storeSupport: store.SupportDeleteRange(),
+		quitCh:       make(chan struct{}),
 	}
 	if !dr.storeSupport {
 		dr.emulatorCh = make(chan struct{}, delBackLog)
@@ -74,90 +82,114 @@ func newDelRangeManager(d *ddl, ctxPool *pools.ResourcePool, supportDelRange boo
 
 // addDelRangeJob implements delRangeManager interface.
 func (dr *delRange) addDelRangeJob(job *model.Job) error {
-	resource, err := dr.ctxPool.Get()
+	ctx, err := dr.sessPool.get()
 	if err != nil {
 		return errors.Trace(err)
 	}
-	defer dr.ctxPool.Put(resource)
-	ctx := resource.(context.Context)
-	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
-	ctx.GetSessionVars().InRestrictedSQL = true
+	defer dr.sessPool.put(ctx)
 
-	err = insertBgJobIntoDeleteRangeTable(ctx, job)
+	err = insertJobIntoDeleteRangeTable(ctx, job)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	if !dr.storeSupport {
 		dr.emulatorCh <- struct{}{}
 	}
-	log.Infof("[ddl] add job (%d,%s) into delete-range table", job.ID, job.Type.String())
+	logutil.BgLogger().Info("[ddl] add job into delete-range table", zap.Int64("jobID", job.ID), zap.String("jobType", job.Type.String()))
 	return nil
+}
+
+// removeFromGCDeleteRange implements delRangeManager interface.
+func (dr *delRange) removeFromGCDeleteRange(jobID, tableID int64) error {
+	ctx, err := dr.sessPool.get()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer dr.sessPool.put(ctx)
+	err = util.RemoveFromGCDeleteRange(ctx, jobID, tableID)
+	return errors.Trace(err)
 }
 
 // start implements delRangeManager interface.
 func (dr *delRange) start() {
 	if !dr.storeSupport {
-		dr.d.wait.Add(1)
+		dr.wait.Add(1)
 		go dr.startEmulator()
 	}
 }
 
 // clear implements delRangeManager interface.
 func (dr *delRange) clear() {
-	log.Infof("[ddl] closing delRange session pool")
-	dr.ctxPool.Close()
+	logutil.BgLogger().Info("[ddl] closing delRange")
+	close(dr.quitCh)
+	dr.wait.Wait()
 }
 
 // startEmulator is only used for those storage engines which don't support
 // delete-range. The emulator fetches records from gc_delete_range table and
 // deletes all keys in each DelRangeTask.
 func (dr *delRange) startEmulator() {
-	defer dr.d.wait.Done()
-	log.Infof("[ddl] start delRange emulator")
+	defer dr.wait.Done()
+	logutil.BgLogger().Info("[ddl] start delRange emulator")
 	for {
 		select {
 		case <-dr.emulatorCh:
-		case <-dr.d.quitCh:
+		case <-dr.quitCh:
 			return
 		}
-		dr.doDelRangeWork()
+		if IsEmulatorGCEnable() {
+			err := dr.doDelRangeWork()
+			terror.Log(errors.Trace(err))
+		}
 	}
 }
 
+// EmulatorGCEnable enables emulator gc. It exports for testing.
+func EmulatorGCEnable() {
+	atomic.StoreInt32(&emulatorGCEnable, 1)
+}
+
+// EmulatorGCDisable disables emulator gc. It exports for testing.
+func EmulatorGCDisable() {
+	atomic.StoreInt32(&emulatorGCEnable, 0)
+}
+
+// IsEmulatorGCEnable indicates whether emulator GC enabled. It exports for testing.
+func IsEmulatorGCEnable() bool {
+	return atomic.LoadInt32(&emulatorGCEnable) == 1
+}
+
 func (dr *delRange) doDelRangeWork() error {
-	resource, err := dr.ctxPool.Get()
+	ctx, err := dr.sessPool.get()
 	if err != nil {
-		log.Errorf("[ddl] delRange emulator get session fail: %s", err)
+		logutil.BgLogger().Error("[ddl] delRange emulator get session failed", zap.Error(err))
 		return errors.Trace(err)
 	}
-	defer dr.ctxPool.Put(resource)
-	ctx := resource.(context.Context)
-	ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, true)
-	ctx.GetSessionVars().InRestrictedSQL = true
+	defer dr.sessPool.put(ctx)
 
-	ranges, err := LoadDeleteRanges(ctx, math.MaxInt64)
+	ranges, err := util.LoadDeleteRanges(ctx, math.MaxInt64)
 	if err != nil {
-		log.Errorf("[dd] delRange emulator load tasks fail: %s", err)
+		logutil.BgLogger().Error("[ddl] delRange emulator load tasks failed", zap.Error(err))
 		return errors.Trace(err)
 	}
 
 	for _, r := range ranges {
 		if err := dr.doTask(ctx, r); err != nil {
-			log.Errorf("[ddl] delRange emulator do task fail: %s", err)
+			logutil.BgLogger().Error("[ddl] delRange emulator do task failed", zap.Error(err))
 			return errors.Trace(err)
 		}
 	}
 	return nil
 }
 
-func (dr *delRange) doTask(ctx context.Context, r DelRangeTask) error {
+func (dr *delRange) doTask(ctx sessionctx.Context, r util.DelRangeTask) error {
 	var oldStartKey, newStartKey kv.Key
-	oldStartKey = r.startKey
+	oldStartKey = r.StartKey
 	for {
 		finish := true
 		dr.keys = dr.keys[:0]
-		err := kv.RunInNewTxn(dr.d.store, false, func(txn kv.Transaction) error {
-			iter, err := txn.Seek(oldStartKey)
+		err := kv.RunInNewTxn(dr.store, false, func(txn kv.Transaction) error {
+			iter, err := txn.Iter(oldStartKey, r.EndKey)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -167,10 +199,7 @@ func (dr *delRange) doTask(ctx context.Context, r DelRangeTask) error {
 				if !iter.Valid() {
 					break
 				}
-				finish = bytes.Compare(iter.Key(), r.endKey) >= 0
-				if finish {
-					break
-				}
+				finish = false
 				dr.keys = append(dr.keys, iter.Key().Clone())
 				newStartKey = iter.Key().Next()
 
@@ -181,7 +210,7 @@ func (dr *delRange) doTask(ctx context.Context, r DelRangeTask) error {
 
 			for _, key := range dr.keys {
 				err := txn.Delete(key)
-				if err != nil && !terror.ErrorEqual(err, kv.ErrNotExist) {
+				if err != nil && !kv.ErrNotExist.Equal(err) {
 					return errors.Trace(err)
 				}
 			}
@@ -191,27 +220,26 @@ func (dr *delRange) doTask(ctx context.Context, r DelRangeTask) error {
 			return errors.Trace(err)
 		}
 		if finish {
-			if err := CompleteDeleteRange(ctx, r); err != nil {
-				log.Errorf("[ddl] delRange emulator complete task fail: %s", err)
+			if err := util.CompleteDeleteRange(ctx, r); err != nil {
+				logutil.BgLogger().Error("[ddl] delRange emulator complete task failed", zap.Error(err))
 				return errors.Trace(err)
 			}
-			log.Infof("[ddl] delRange emulator complete task: (%d, %d)", r.jobID, r.elementID)
+			logutil.BgLogger().Info("[ddl] delRange emulator complete task", zap.Int64("jobID", r.JobID), zap.Int64("elementID", r.ElementID))
 			break
-		} else {
-			if err := updateDeleteRange(ctx, r, newStartKey, oldStartKey); err != nil {
-				log.Errorf("[ddl] delRange emulator update task fail: %s", err)
-			}
-			oldStartKey = newStartKey
 		}
+		if err := util.UpdateDeleteRange(ctx, r, newStartKey, oldStartKey); err != nil {
+			logutil.BgLogger().Error("[ddl] delRange emulator update task failed", zap.Error(err))
+		}
+		oldStartKey = newStartKey
 	}
 	return nil
 }
 
-// insertBgJobIntoDeleteRangeTable parses the job into delete-range arguments,
+// insertJobIntoDeleteRangeTable parses the job into delete-range arguments,
 // and inserts a new record into gc_delete_range table. The primary key is
 // job ID, so we ignore key conflict error.
-func insertBgJobIntoDeleteRangeTable(ctx context.Context, job *model.Job) error {
-	now, err := getNowTS(ctx)
+func insertJobIntoDeleteRangeTable(ctx sessionctx.Context, job *model.Job) error {
+	now, err := getNowTSO(ctx)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -232,121 +260,93 @@ func insertBgJobIntoDeleteRangeTable(ctx context.Context, job *model.Job) error 
 		}
 	case model.ActionDropTable, model.ActionTruncateTable:
 		tableID := job.TableID
-		startKey := tablecodec.EncodeTablePrefix(tableID)
+		// The startKey here is for compatibility with previous versions, old version did not endKey so don't have to deal with.
+		var startKey kv.Key
+		var physicalTableIDs []int64
+		if err := job.DecodeArgs(startKey, &physicalTableIDs); err != nil {
+			return errors.Trace(err)
+		}
+		if len(physicalTableIDs) > 0 {
+			for _, pid := range physicalTableIDs {
+				startKey = tablecodec.EncodeTablePrefix(pid)
+				endKey := tablecodec.EncodeTablePrefix(pid + 1)
+				if err := doInsert(s, job.ID, pid, startKey, endKey, now); err != nil {
+					return errors.Trace(err)
+				}
+			}
+			return nil
+		}
+		startKey = tablecodec.EncodeTablePrefix(tableID)
 		endKey := tablecodec.EncodeTablePrefix(tableID + 1)
 		return doInsert(s, job.ID, tableID, startKey, endKey, now)
+	case model.ActionDropTablePartition, model.ActionTruncateTablePartition:
+		var physicalTableID int64
+		if err := job.DecodeArgs(&physicalTableID); err != nil {
+			return errors.Trace(err)
+		}
+		startKey := tablecodec.EncodeTablePrefix(physicalTableID)
+		endKey := tablecodec.EncodeTablePrefix(physicalTableID + 1)
+		return doInsert(s, job.ID, physicalTableID, startKey, endKey, now)
+	// ActionAddIndex needs do it, because it needs to be rolled back when it's canceled.
+	case model.ActionAddIndex:
+		tableID := job.TableID
+		var indexID int64
+		var partitionIDs []int64
+		if err := job.DecodeArgs(&indexID, &partitionIDs); err != nil {
+			return errors.Trace(err)
+		}
+		if len(partitionIDs) > 0 {
+			for _, pid := range partitionIDs {
+				startKey := tablecodec.EncodeTableIndexPrefix(pid, indexID)
+				endKey := tablecodec.EncodeTableIndexPrefix(pid, indexID+1)
+				if err := doInsert(s, job.ID, indexID, startKey, endKey, now); err != nil {
+					return errors.Trace(err)
+				}
+			}
+		} else {
+			startKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
+			endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
+			return doInsert(s, job.ID, indexID, startKey, endKey, now)
+		}
 	case model.ActionDropIndex:
 		tableID := job.TableID
 		var indexName interface{}
 		var indexID int64
-		if err := job.DecodeArgs(&indexName, &indexID); err != nil {
+		var partitionIDs []int64
+		if err := job.DecodeArgs(&indexName, &indexID, &partitionIDs); err != nil {
 			return errors.Trace(err)
 		}
-		startKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
-		endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
-		return doInsert(s, job.ID, indexID, startKey, endKey, now)
+		if len(partitionIDs) > 0 {
+			for _, pid := range partitionIDs {
+				startKey := tablecodec.EncodeTableIndexPrefix(pid, indexID)
+				endKey := tablecodec.EncodeTableIndexPrefix(pid, indexID+1)
+				if err := doInsert(s, job.ID, indexID, startKey, endKey, now); err != nil {
+					return errors.Trace(err)
+				}
+			}
+		} else {
+			startKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
+			endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
+			return doInsert(s, job.ID, indexID, startKey, endKey, now)
+		}
 	}
 	return nil
 }
 
-func doInsert(s sqlexec.SQLExecutor, jobID int64, elementID int64, startKey, endKey kv.Key, ts int64) error {
-	log.Infof("[ddl] insert into delete-range table with key: (%d,%d)", jobID, elementID)
+func doInsert(s sqlexec.SQLExecutor, jobID int64, elementID int64, startKey, endKey kv.Key, ts uint64) error {
+	logutil.BgLogger().Info("[ddl] insert into delete-range table", zap.Int64("jobID", jobID), zap.Int64("elementID", elementID))
 	startKeyEncoded := hex.EncodeToString(startKey)
 	endKeyEncoded := hex.EncodeToString(endKey)
 	sql := fmt.Sprintf(insertDeleteRangeSQL, jobID, elementID, startKeyEncoded, endKeyEncoded, ts)
-	_, err := s.Execute(sql)
+	_, err := s.Execute(context.Background(), sql)
 	return errors.Trace(err)
 }
 
-// DelRangeTask is for run delete-range command in gc_worker.
-type DelRangeTask struct {
-	jobID, elementID int64
-	startKey, endKey []byte
-}
-
-// Range returns the range [start, end) to delete.
-func (t DelRangeTask) Range() ([]byte, []byte) {
-	return t.startKey, t.endKey
-}
-
-// LoadDeleteRanges loads delete range tasks from gc_delete_range table.
-func LoadDeleteRanges(ctx context.Context, safePoint uint64) (ranges []DelRangeTask, _ error) {
-	sql := fmt.Sprintf(loadDeleteRangeSQL, safePoint)
-	rss, err := ctx.(sqlexec.SQLExecutor).Execute(sql)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	rs := rss[0]
-	for {
-		row, err := rs.Next()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if row == nil {
-			break
-		}
-		startKey, err := hex.DecodeString(row.Data[2].GetString())
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		endKey, err := hex.DecodeString(row.Data[3].GetString())
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		ranges = append(ranges, DelRangeTask{
-			jobID:     row.Data[0].GetInt64(),
-			elementID: row.Data[1].GetInt64(),
-			startKey:  startKey,
-			endKey:    endKey,
-		})
-	}
-	return ranges, nil
-}
-
-// CompleteDeleteRange deletes a record from gc_delete_range table.
-// NOTE: This function WILL NOT start and run in a new transaction internally.
-func CompleteDeleteRange(ctx context.Context, dr DelRangeTask) error {
-	sql := fmt.Sprintf(completeDeleteRangeSQL, dr.jobID, dr.elementID)
-	_, err := ctx.(sqlexec.SQLExecutor).Execute(sql)
-	return errors.Trace(err)
-}
-
-// updateDeleteRange is only for emulator.
-func updateDeleteRange(ctx context.Context, dr DelRangeTask, newStartKey, oldStartKey kv.Key) error {
-	newStartKeyHex := hex.EncodeToString(newStartKey)
-	oldStartKeyHex := hex.EncodeToString(oldStartKey)
-	sql := fmt.Sprintf(updateDeleteRangeSQL, newStartKeyHex, dr.jobID, dr.elementID, oldStartKeyHex)
-	_, err := ctx.(sqlexec.SQLExecutor).Execute(sql)
-	return errors.Trace(err)
-}
-
-// LoadPendingBgJobsIntoDeleteTable loads all pending DDL backgroud jobs
-// into table `gc_delete_range` so that gc worker can process them.
-// NOTE: This function WILL NOT start and run in a new transaction internally.
-func LoadPendingBgJobsIntoDeleteTable(ctx context.Context) (err error) {
-	log.Infof("[ddl] loading pending backgroud DDL jobs")
-	var met = meta.NewMeta(ctx.Txn())
-	for {
-		var job *model.Job
-		job, err = met.DeQueueBgJob()
-		if err != nil || job == nil {
-			break
-		}
-		err = insertBgJobIntoDeleteRangeTable(ctx, job)
-		if err != nil {
-			break
-		}
-	}
-	return errors.Trace(err)
-}
-
-// getNowTS gets the current timestamp, in second.
-func getNowTS(ctx context.Context) (int64, error) {
+// getNowTS gets the current timestamp, in TSO.
+func getNowTSO(ctx sessionctx.Context) (uint64, error) {
 	currVer, err := ctx.GetStore().CurrentVersion()
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
-	physical := oracle.ExtractPhysical(currVer.Ver)
-	return physical / 1e3, nil
+	return currVer.Ver, nil
 }
